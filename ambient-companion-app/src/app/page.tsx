@@ -11,7 +11,7 @@ const TeachableAudioMonitor = dynamic(
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
-import { Bell, ShoppingCart, Activity, ShieldAlert, Zap, Settings, Mic, X, Heart, Phone, Users } from "lucide-react";
+import { Bell, Activity, ShieldAlert, Zap, Settings, Mic, Heart } from "lucide-react";
 
 export default function Home() {
   const [logs, setLogs] = useState<{ id: string, message: string, time: string, type: string, source?: string, target?: string, engine?: string }[]>([]);
@@ -21,18 +21,8 @@ export default function Home() {
   const [timeOfDay, setTimeOfDay] = useState("2:00 PM");
   const [homeState, setHomeState] = useState("quiet");
   
-  // Phase 3: Active Profile (View As)
-  const [activeProfile, setActiveProfile] = useState("children");
-
-  // Phase 2: Amazon Cart State
-  const [cartItems, setCartItems] = useState<{name: string, price: string}[]>([]);
-  const [isCartOpen, setIsCartOpen] = useState(false);
-
   // Phase 4: Real-time DB Polling for Cross-Browser Sync
   useEffect(() => {
-    // If AWS is not connected, at least clear the cart locally when switching profiles to simulate separation
-    setCartItems([]);
-
     const fetchData = async () => {
       try {
         const resLogs = await fetch("/api/logs");
@@ -40,24 +30,17 @@ export default function Home() {
         if (dataLogs.success && dataLogs.logs) {
           setLogs(dataLogs.logs);
         }
-
-        const resCart = await fetch(`/api/cart?profile=${activeProfile.toLowerCase()}`);
-        const dataCart = await resCart.json();
-        if (dataCart.success && dataCart.cartItems) {
-          setCartItems(dataCart.cartItems);
-        }
       } catch (err) {
         // ignore errors if not set up
       }
     };
     
-    // Fetch immediately on profile change
     fetchData();
 
     // Poll every 3 seconds
     const interval = setInterval(fetchData, 3000);
     return () => clearInterval(interval);
-  }, [activeProfile]);
+  }, []);
 
   const triggerEvent = async (classification: string, label: string) => {
     const displayTime = timeOfDay.split(' ').slice(0, 2).join(' '); // Extracts just "2:00 PM" from "2:00 PM (Afternoon)"
@@ -73,23 +56,22 @@ export default function Home() {
           classification, 
           source: "simulator",
           timeOfDay,
-          homeState,
-          sourceProfile: activeProfile
+          homeState
         }),
       });
       const data = await response.json();
       setIsListening(false);
 
       if (data.success) {
-        const { action_type, message, suggested_cart_items, target_profile } = data.data;
+        const { action_type, message, target_profile, physical_action } = data.data;
 
-        // ALWAYS log the event, but store source and target so we can filter later
+        // ALWAYS log the event
         const newTriggerLog = {
           id: Date.now().toString() + "trig",
           message: `Detected: ${label}`,
           time: displayTime,
           type: "trigger",
-          source: activeProfile,
+          source: "home",
           target: "everyone"
         };
 
@@ -98,15 +80,15 @@ export default function Home() {
           message: `AI Action: ${message}`,
           time: displayTime,
           type: action_type,
-          source: activeProfile,
-          target: target_profile,
+          source: "home",
+          target: target_profile || "everyone",
           engine: data.source || "mock"
         };
 
         setLogs((prev) => [newResponseLog, newTriggerLog, ...prev]);
 
-        // Smart Home Action: Play Audio if the AI decides to play a lullaby
-        if (message.toLowerCase().includes("lullaby") || message.toLowerCase().includes("music")) {
+        // Smart Home Action: Play Audio if the AI explicitly decides to play a lullaby
+        if (physical_action === "lullaby") {
           // Using Web Audio API because it is natively supported by all browsers instantly without network requests
           try {
             const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
@@ -144,59 +126,8 @@ export default function Home() {
           }
         }
 
-        const normalizedTarget = (target_profile || "").toLowerCase();
-        
-        // EMPATHY RULE for popups: Do NOT show a popup if we are not the target.
-        if (normalizedTarget !== "everyone" && normalizedTarget !== activeProfile.toLowerCase()) {
-           return;
-        }
-
-        if (action_type === "commerce") {
-          toast.custom((t) => (
-            <div className="bg-white border border-gray-200 shadow-xl p-4 flex gap-4 w-[356px] rounded-sm pointer-events-auto transition-all duration-300">
-              <div className="bg-gray-100 w-16 h-16 rounded flex flex-col items-center justify-center text-2xl border border-gray-200 shrink-0">
-                🍼
-              </div>
-              <div className="flex-1">
-                <h4 className="text-amazon-link font-medium text-sm hover:underline cursor-pointer">
-                  {suggested_cart_items?.[0]?.name || "Baby Supplies"}
-                </h4>
-                <p className="text-xs text-gray-500 mt-1">{message}</p>
-                <div className="flex items-center gap-2 mt-1">
-                  <span className="text-amazon-textprimary font-bold text-sm">
-                    {suggested_cart_items?.[0]?.price || "$24.99"}
-                  </span>
-                  <span className="text-xs text-gray-500 bg-gray-100 px-1 py-0.5 rounded">Prime</span>
-                </div>
-                <div className="mt-3">
-                  <Button 
-                    className="bg-amazon-yellow hover:bg-amazon-orange text-black w-full h-8 text-xs font-medium rounded-sm shadow-sm transition-colors"
-                    onClick={async () => {
-                      const itemToAdd = suggested_cart_items?.[0] || { name: "Baby Supplies", price: "$24.99" };
-                      
-                      // Optimistic UI Update
-                      setCartItems(prev => [...prev, itemToAdd]);
-                      toast.dismiss(t);
-                      toast.success(`Added ${itemToAdd.name} to Cart`, {
-                        position: "bottom-center"
-                      });
-
-                      // Save to DynamoDB
-                      try {
-                        await fetch("/api/cart", {
-                          method: "POST",
-                          body: JSON.stringify({ item: itemToAdd, profile: activeProfile.toLowerCase() })
-                        });
-                      } catch (e) {}
-                    }}
-                  >
-                    Add to Cart
-                  </Button>
-                </div>
-              </div>
-            </div>
-          ), { duration: 8000 });
-        } else if (action_type === "alert") {
+        // EMPATHY RULE for popups
+        if (action_type === "alert") {
           toast.custom((t) => (
             <div className="bg-white border-l-4 border-red-600 shadow-xl p-4 flex gap-3 w-[356px] rounded-sm pointer-events-auto">
               <ShieldAlert className="w-5 h-5 text-red-600 shrink-0 mt-0.5 animate-pulse" />
@@ -217,19 +148,11 @@ export default function Home() {
             <div className="bg-white border-l-4 border-purple-500 shadow-xl p-4 flex gap-3 w-[356px] rounded-sm pointer-events-auto">
               <Heart className="w-5 h-5 text-purple-500 shrink-0 mt-0.5 animate-pulse" />
               <div className="flex-1">
-                <h4 className="text-purple-700 font-bold text-sm">Family Connection</h4>
-                <p className="text-xs text-gray-700 mt-1">{message}</p>
-                <div className="flex gap-2 mt-3">
-                  <Button 
-                    className="bg-purple-100 hover:bg-purple-200 text-purple-800 h-7 px-3 text-xs font-medium rounded-sm shadow-sm transition-colors"
-                    onClick={() => {
-                      toast.dismiss(t);
-                      toast.success("Dropping in on Living Room (Alexa)...");
-                    }}
-                  >
-                    <Phone className="w-3 h-3 mr-1" /> Drop In Now
-                  </Button>
-                </div>
+                <h4 className="text-purple-700 font-bold text-sm">Empathy Notification Routed</h4>
+                <p className="text-xs text-purple-900 mt-1 mb-2 bg-purple-50 p-1.5 rounded border border-purple-100">
+                  📲 Sent silently to: <strong>{target_profile || "Family Member"}</strong>
+                </p>
+                <p className="text-xs text-gray-600">{message}</p>
               </div>
             </div>
           ), { duration: 8000 });
@@ -260,35 +183,13 @@ export default function Home() {
           <h1 className="text-xl font-bold tracking-tight">Alexa Ambient Companion</h1>
         </div>
         <div className="flex items-center gap-4">
-          <select 
-            className="bg-amazon-navy border border-gray-600 rounded px-2 py-1 text-xs text-white outline-none cursor-pointer"
-            value={activeProfile}
-            onChange={(e) => setActiveProfile(e.target.value)}
-          >
-            <option value="parents">View As: Parents (Living Room)</option>
-            <option value="children">View As: Son (Seattle)</option>
-            <option value="partner">View As: Partner</option>
-            <option value="everyone">View As: Everyone</option>
-          </select>
-          <div 
-            className="flex items-center gap-1 cursor-pointer hover:text-amazon-orange transition-colors relative"
-            onClick={() => setIsCartOpen(!isCartOpen)}
-          >
-            <ShoppingCart className="w-5 h-5" />
-            {cartItems.length > 0 && (
-              <span className="absolute -top-2 -left-2 bg-amazon-orange text-black font-bold text-[10px] w-4 h-4 flex items-center justify-center rounded-full">
-                {cartItems.length}
-              </span>
-            )}
-            <span className="font-medium hidden sm:inline">Cart</span>
-          </div>
           <Settings className="w-5 h-5 text-white cursor-pointer hover:text-gray-300" />
         </div>
       </header>
 
       {/* Sub Navigation */}
       <div className="bg-amazon-navy text-white px-4 py-2 flex gap-4 text-sm font-medium overflow-x-auto whitespace-nowrap">
-        <span className="cursor-pointer hover:text-amazon-orange">Today's Insights</span>
+        <span className="cursor-pointer hover:text-amazon-orange">Today&apos;s Insights</span>
         <span className="cursor-pointer hover:text-amazon-orange">Family Care</span>
         <span className="cursor-pointer hover:text-amazon-orange">Routines</span>
         <span className="cursor-pointer hover:text-amazon-orange">Safety</span>
@@ -303,7 +204,7 @@ export default function Home() {
           <Card className="rounded-md border-0 shadow-sm overflow-hidden">
             <CardHeader className="bg-gray-50 border-b pb-4">
               <CardTitle className="text-lg flex items-center gap-2">
-<<<<<<< HEAD
+
                 <Settings className="w-5 h-5 text-gray-500" />
                 Household Context
               </CardTitle>
@@ -398,40 +299,7 @@ export default function Home() {
             </CardContent>
           </Card>
 
-          {/* Phase 3: Connected Family Panel */}
-          <Card className="rounded-md border-0 shadow-sm overflow-hidden">
-            <CardHeader className="bg-gray-50 border-b pb-3">
-              <CardTitle className="text-sm flex items-center gap-2 font-bold text-gray-700">
-                <Users className="w-4 h-4 text-purple-500" />
-                Family Care Circle
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="pt-4 flex flex-col gap-3">
-              <div className="flex items-center justify-between text-sm">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-700 font-bold text-xs">S</div>
-                  <div>
-                    <p className="font-medium">Son (Rahul)</p>
-                    <p className="text-[10px] text-gray-500">Seattle • Notified 2d ago</p>
-                  </div>
-                </div>
-                <Button variant="ghost" size="sm" className="h-6 text-xs text-amazon-link hover:underline">Drop In</Button>
-              </div>
-              <div className="flex items-center justify-between text-sm">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 rounded-full bg-pink-100 flex items-center justify-center text-pink-700 font-bold text-xs">D</div>
-                  <div>
-                    <p className="font-medium">Daughter (Priya)</p>
-                    <p className="text-[10px] text-gray-500">New York • Notified 5h ago</p>
-                  </div>
-                </div>
-                <Button variant="ghost" size="sm" className="h-6 text-xs text-amazon-link hover:underline">Drop In</Button>
-              </div>
-              <Button variant="outline" className="w-full h-8 text-xs mt-2 border-dashed border-gray-300 text-gray-500 hover:bg-gray-50">
-                + Add Family Member
-              </Button>
-            </CardContent>
-          </Card>
+
         </div>
 
         {/* Right Column: Dashboard & Logs */}
@@ -460,17 +328,7 @@ export default function Home() {
               <CardDescription>Real-time log of events and AI proactive decisions</CardDescription>
             </CardHeader>
             <CardContent className="p-0">
-              {logs.filter(log => {
-                  const t = (log.target || "").toLowerCase();
-                  const s = (log.source || "").toLowerCase();
-                  const a = activeProfile.toLowerCase();
-                  
-                  // Empathy events: ONLY the target can see it.
-                  if (log.type === "family_connect") return t === a;
-                  
-                  // Normal events: ONLY the source (where it was triggered) can see it.
-                  return s === a || t === "everyone";
-              }).length === 0 ? (
+              {logs.length === 0 ? (
                 <div className="p-12 text-center text-gray-500 flex flex-col items-center">
                   <Activity className="w-12 h-12 text-gray-300 mb-4" />
                   <p>No events recorded yet.</p>
@@ -478,13 +336,7 @@ export default function Home() {
                 </div>
               ) : (
                 <ul className="divide-y max-h-[500px] overflow-y-auto">
-                  {logs.filter(log => {
-                    const t = (log.target || "").toLowerCase();
-                    const s = (log.source || "").toLowerCase();
-                    const a = activeProfile.toLowerCase();
-                    if (log.type === "family_connect") return t === a;
-                    return s === a || t === "everyone";
-                  }).map((log) => (
+                  {logs.map((log) => (
                     <li key={log.id} className="p-4 flex flex-col gap-1 hover:bg-gray-50 transition-colors group">
                       <div className="flex justify-between items-start">
                         <div className="flex items-center gap-2">
@@ -512,66 +364,7 @@ export default function Home() {
         </div>
       </main>
 
-      {/* Phase 2: Sliding Amazon Cart Panel */}
-      {isCartOpen && (
-        <>
-          {/* Overlay */}
-          <div 
-            className="fixed inset-0 bg-black/50 z-40 transition-opacity"
-            onClick={() => setIsCartOpen(false)}
-          />
-          
-          {/* Side Cart Drawer */}
-          <div className="fixed right-0 top-0 bottom-0 w-full sm:w-96 bg-white shadow-2xl z-50 flex flex-col animate-in slide-in-from-right duration-300">
-            <div className="flex justify-between items-center p-4 border-b bg-gray-50">
-              <h2 className="text-xl font-bold text-amazon-black flex items-center gap-2">
-                <ShoppingCart className="w-6 h-6" /> Subtotal
-              </h2>
-              <button 
-                onClick={() => setIsCartOpen(false)} 
-                className="p-2 hover:bg-gray-200 rounded-full transition-colors"
-              >
-                <X className="w-5 h-5 text-gray-500" />
-              </button>
-            </div>
-            
-            <div className="flex-1 overflow-y-auto p-4 bg-white">
-              {cartItems.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-full text-center text-gray-500 space-y-4">
-                  <ShoppingCart className="w-16 h-16 text-gray-200" />
-                  <p>Your Amazon Cart is empty.</p>
-                </div>
-              ) : (
-                <div className="flex flex-col gap-4">
-                  {cartItems.map((item, idx) => (
-                    <div key={idx} className="flex gap-4 border-b border-gray-100 pb-4">
-                      <div className="w-20 h-20 bg-gray-50 border rounded-sm flex items-center justify-center text-3xl shrink-0 shadow-sm">
-                        📦
-                      </div>
-                      <div className="flex-1 flex flex-col justify-center">
-                        <p className="font-medium text-sm text-amazon-link hover:underline cursor-pointer leading-tight mb-1">
-                          {item.name}
-                        </p>
-                        <p className="text-amazon-textprimary font-bold text-lg">{item.price}</p>
-                        <p className="text-xs text-green-700 font-medium">In Stock</p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-            
-            {/* Cart Footer */}
-            {cartItems.length > 0 && (
-              <div className="p-4 border-t bg-gray-50 shadow-[0_-4px_6px_-1px_rgb(0,0,0,0.05)]">
-                <Button className="w-full bg-amazon-yellow hover:bg-amazon-orange text-black font-medium h-12 text-sm shadow-sm">
-                  Proceed to Checkout ({cartItems.length} items)
-                </Button>
-              </div>
-            )}
-          </div>
-        </>
-      )}
+
 
       <Toaster position="top-center" richColors />
     </div>
