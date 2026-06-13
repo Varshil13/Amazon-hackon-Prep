@@ -2,6 +2,12 @@
 
 import { useState, useEffect } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import dynamic from "next/dynamic";
+
+const TeachableAudioMonitor = dynamic(
+  () => import("@/components/TeachableAudioMonitor").then((mod) => mod.TeachableAudioMonitor),
+  { ssr: false }
+);
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
@@ -297,6 +303,7 @@ export default function Home() {
           <Card className="rounded-md border-0 shadow-sm overflow-hidden">
             <CardHeader className="bg-gray-50 border-b pb-4">
               <CardTitle className="text-lg flex items-center gap-2">
+<<<<<<< HEAD
                 <Settings className="w-5 h-5 text-gray-500" />
                 Household Context
               </CardTitle>
@@ -337,7 +344,7 @@ export default function Home() {
           {/* Edge AI Simulator */}
           <Card className="rounded-md border-0 shadow-sm overflow-hidden">
             <CardHeader className="bg-gray-50 border-b pb-4">
-              <CardTitle className="text-lg flex items-center gap-2">
+              <CardTitle className="text-lg flex items-center gap-2">                
                 <div className="relative">
                   <Mic className={`w-5 h-5 ${isListening ? "text-red-500" : "text-gray-400"}`} />
                   {isListening && (
@@ -386,6 +393,8 @@ export default function Home() {
                 <Activity className="w-4 h-4 mr-2 text-blue-500" />
                 Trigger: High Stress
               </Button>
+
+              <TeachableAudioMonitor onEventDetected={triggerEvent} />
             </CardContent>
           </Card>
 
