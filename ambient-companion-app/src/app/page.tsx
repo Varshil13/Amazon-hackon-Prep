@@ -4,8 +4,8 @@ import { useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import dynamic from "next/dynamic";
 
-const YAMNetAudioMonitor = dynamic(
-  () => import("@/components/YAMNetAudioMonitor").then((mod) => mod.YAMNetAudioMonitor),
+const TeachableAudioMonitor = dynamic(
+  () => import("@/components/TeachableAudioMonitor").then((mod) => mod.TeachableAudioMonitor),
   { ssr: false }
 );
 import { Button } from "@/components/ui/button";
@@ -170,7 +170,7 @@ export default function Home() {
                 Trigger: Water Motor
               </Button>
               
-              <YAMNetAudioMonitor onEventDetected={triggerEvent} />
+              <TeachableAudioMonitor onEventDetected={triggerEvent} />
             </CardContent>
           </Card>
         </div>
