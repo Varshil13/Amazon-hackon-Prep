@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { dynamoDb } from "@/lib/dynamodb";
+import { PutCommand } from "@aws-sdk/lib-dynamodb";
 
 export async function POST(request: Request) {
   try {
@@ -125,6 +127,43 @@ Return raw JSON only.
         aiContent = aiContent.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
         const aiDecision = JSON.parse(aiContent);
 
+        // --- DYNAMODB LOGGING ---
+        if (
+          process.env.AWS_ACCESS_KEY_ID &&
+          process.env.AWS_ACCESS_KEY_ID !== "paste_your_access_key_here" &&
+          process.env.AWS_ACCESS_KEY_ID !== "dummy"
+        ) {
+          const timestamp = Date.now();
+          const displayTime = timeOfDay.split(' ').slice(0, 2).join(' ');
+          try {
+            await dynamoDb.send(new PutCommand({
+              TableName: "HouseholdLogs",
+              Item: {
+                id: timestamp.toString() + "trig",
+                timestamp: timestamp,
+                message: `Detected: ${body.classification}`,
+                time: displayTime,
+                type: "trigger",
+                source: body.sourceProfile || "unknown",
+                target: "everyone"
+              }
+            }));
+            await dynamoDb.send(new PutCommand({
+              TableName: "HouseholdLogs",
+              Item: {
+                id: timestamp.toString() + "res",
+                timestamp: timestamp + 1,
+                message: `AI Action: ${aiDecision.message}`,
+                time: displayTime,
+                type: aiDecision.action_type,
+                source: body.sourceProfile || "unknown",
+                target: aiDecision.target_profile || "everyone"
+              }
+            }));
+            console.log("Logged to DynamoDB");
+          } catch (e) { console.error("DB Error", e); }
+        }
+
         return NextResponse.json({
           success: true,
           data: aiDecision,
@@ -205,13 +244,60 @@ Return raw JSON only.
 
     await new Promise((resolve) => setTimeout(resolve, 800));
 
+    const responsePayload = {
+      action_type: action_type,
+      target_profile: "everyone",
+      message: message,
+      suggested_cart_items: suggested_cart_items,
+    };
+
+    // --- DYNAMODB LOGGING ---
+    if (
+      process.env.AWS_ACCESS_KEY_ID &&
+      process.env.AWS_ACCESS_KEY_ID !== "paste_your_access_key_here" &&
+      process.env.AWS_ACCESS_KEY_ID !== "dummy"
+    ) {
+      const timestamp = Date.now();
+      const displayTime = timeOfDay.split(' ').slice(0, 2).join(' ');
+
+      try {
+        // Log the Trigger
+        await dynamoDb.send(new PutCommand({
+          TableName: "HouseholdLogs",
+          Item: {
+            id: timestamp.toString() + "trig",
+            timestamp: timestamp,
+            message: `Detected: ${body.classification}`,
+            time: displayTime,
+            type: "trigger",
+            source: body.sourceProfile || "unknown",
+            target: "everyone"
+          }
+        }));
+
+        // Log the AI Action
+        await dynamoDb.send(new PutCommand({
+          TableName: "HouseholdLogs",
+          Item: {
+            id: timestamp.toString() + "res",
+            timestamp: timestamp + 1, // ensure it sorts after trigger
+            message: `AI Action: ${message}`,
+            time: displayTime,
+            type: action_type,
+            source: body.sourceProfile || "unknown",
+            target: "everyone"
+          }
+        }));
+        console.log("Successfully logged to DynamoDB");
+      } catch (dbError) {
+        console.error("DynamoDB Write Error:", dbError);
+        // Don't fail the API call if DB logging fails during hackathon
+      }
+    }
+
     return NextResponse.json({
       success: true,
-      data: {
-        action_type,
-        message,
-        suggested_cart_items,
-      },
+      data: responsePayload,
       source: "mock",
     });
   } catch (error) {

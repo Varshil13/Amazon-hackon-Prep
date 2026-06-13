@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
@@ -21,6 +21,26 @@ export default function Home() {
   // Phase 2: Amazon Cart State
   const [cartItems, setCartItems] = useState<{name: string, price: string}[]>([]);
   const [isCartOpen, setIsCartOpen] = useState(false);
+
+  // Phase 4: Real-time DB Polling for Cross-Browser Sync
+  useEffect(() => {
+    const fetchLogs = async () => {
+      try {
+        const res = await fetch("/api/logs");
+        const data = await res.json();
+        // Only override local state if AWS is configured and returned success
+        if (data.success && data.logs) {
+          setLogs(data.logs);
+        }
+      } catch (err) {
+        // ignore errors if not set up
+      }
+    };
+    
+    // Poll every 3 seconds
+    const interval = setInterval(fetchLogs, 3000);
+    return () => clearInterval(interval);
+  }, []);
 
   const triggerEvent = async (classification: string, label: string) => {
     const displayTime = timeOfDay.split(' ').slice(0, 2).join(' '); // Extracts just "2:00 PM" from "2:00 PM (Afternoon)"
