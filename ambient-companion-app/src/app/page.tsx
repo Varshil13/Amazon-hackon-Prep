@@ -2,6 +2,12 @@
 
 import { useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import dynamic from "next/dynamic";
+
+const YAMNetAudioMonitor = dynamic(
+  () => import("@/components/YAMNetAudioMonitor").then((mod) => mod.YAMNetAudioMonitor),
+  { ssr: false }
+);
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
@@ -9,7 +15,6 @@ import { Bell, ShoppingCart, Activity, ShieldAlert, Zap, Settings, Mic } from "l
 
 export default function Home() {
   const [logs, setLogs] = useState<{ id: string, message: string, time: string, type: string }[]>([]);
-  const [isListening, setIsListening] = useState(false);
 
   const triggerEvent = async (classification: string, label: string) => {
     const newLog = {
@@ -135,7 +140,7 @@ export default function Home() {
           <Card className="rounded-md border-0 shadow-sm">
             <CardHeader className="bg-gray-50 border-b pb-4 rounded-t-md">
               <CardTitle className="text-lg flex items-center gap-2">
-                <Mic className={isListening ? "text-red-500 animate-pulse" : "text-gray-400"} />
+                <Mic className="text-gray-400" />
                 Edge AI Simulation
               </CardTitle>
               <CardDescription>
@@ -165,15 +170,7 @@ export default function Home() {
                 Trigger: Water Motor
               </Button>
               
-              <div className="pt-4 mt-2 border-t">
-                <Button 
-                  variant="outline" 
-                  className="w-full rounded-sm"
-                  onClick={() => setIsListening(!isListening)}
-                >
-                  {isListening ? "Stop Live Mic (Mock)" : "Start Live Mic (Mock)"}
-                </Button>
-              </div>
+              <YAMNetAudioMonitor onEventDetected={triggerEvent} />
             </CardContent>
           </Card>
         </div>
