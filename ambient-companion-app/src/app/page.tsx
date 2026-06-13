@@ -8,7 +8,7 @@ import { toast } from "sonner";
 import { Bell, ShoppingCart, Activity, ShieldAlert, Zap, Settings, Mic, X, Heart, Phone, Users } from "lucide-react";
 
 export default function Home() {
-  const [logs, setLogs] = useState<{ id: string, message: string, time: string, type: string }[]>([]);
+  const [logs, setLogs] = useState<{ id: string, message: string, time: string, type: string, source?: string, target?: string, engine?: string }[]>([]);
   const [isListening, setIsListening] = useState(false);
   
   // Phase 2: Dynamic Context State
@@ -24,23 +24,34 @@ export default function Home() {
 
   // Phase 4: Real-time DB Polling for Cross-Browser Sync
   useEffect(() => {
-    const fetchLogs = async () => {
+    // If AWS is not connected, at least clear the cart locally when switching profiles to simulate separation
+    setCartItems([]);
+
+    const fetchData = async () => {
       try {
-        const res = await fetch("/api/logs");
-        const data = await res.json();
-        // Only override local state if AWS is configured and returned success
-        if (data.success && data.logs) {
-          setLogs(data.logs);
+        const resLogs = await fetch("/api/logs");
+        const dataLogs = await resLogs.json();
+        if (dataLogs.success && dataLogs.logs) {
+          setLogs(dataLogs.logs);
+        }
+
+        const resCart = await fetch(`/api/cart?profile=${activeProfile.toLowerCase()}`);
+        const dataCart = await resCart.json();
+        if (dataCart.success && dataCart.cartItems) {
+          setCartItems(dataCart.cartItems);
         }
       } catch (err) {
         // ignore errors if not set up
       }
     };
     
+    // Fetch immediately on profile change
+    fetchData();
+
     // Poll every 3 seconds
-    const interval = setInterval(fetchLogs, 3000);
+    const interval = setInterval(fetchData, 3000);
     return () => clearInterval(interval);
-  }, []);
+  }, [activeProfile]);
 
   const triggerEvent = async (classification: string, label: string) => {
     const displayTime = timeOfDay.split(' ').slice(0, 2).join(' '); // Extracts just "2:00 PM" from "2:00 PM (Afternoon)"
@@ -82,10 +93,50 @@ export default function Home() {
           time: displayTime,
           type: action_type,
           source: activeProfile,
-          target: target_profile
+          target: target_profile,
+          engine: data.source || "mock"
         };
 
         setLogs((prev) => [newResponseLog, newTriggerLog, ...prev]);
+
+        // Smart Home Action: Play Audio if the AI decides to play a lullaby
+        if (message.toLowerCase().includes("lullaby") || message.toLowerCase().includes("music")) {
+          // Using Web Audio API because it is natively supported by all browsers instantly without network requests
+          try {
+            const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+            const ctx = new AudioContext();
+            
+            // Play a soothing C Major chord (C, E, G) 3 times
+            const repeats = 3;
+            const delayBetweenStrums = 2.0; // Seconds
+            
+            for (let r = 0; r < repeats; r++) {
+              const timeOffset = r * delayBetweenStrums;
+              
+              [261.63, 329.63, 392.00].forEach((freq, i) => {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = "sine";
+                osc.frequency.value = freq;
+                
+                const startTime = ctx.currentTime + timeOffset + (i * 0.2); // Strum effect
+                
+                // Fade out gently like a music box
+                gain.gain.setValueAtTime(0, startTime);
+                gain.gain.linearRampToValueAtTime(0.3, startTime + 0.1);
+                gain.gain.exponentialRampToValueAtTime(0.01, startTime + 1.8);
+                
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                
+                osc.start(startTime);
+                osc.stop(startTime + 2);
+              });
+            }
+          } catch (e) {
+            console.error("Web Audio API failed:", e);
+          }
+        }
 
         const normalizedTarget = (target_profile || "").toLowerCase();
         
@@ -114,13 +165,23 @@ export default function Home() {
                 <div className="mt-3">
                   <Button 
                     className="bg-amazon-yellow hover:bg-amazon-orange text-black w-full h-8 text-xs font-medium rounded-sm shadow-sm transition-colors"
-                    onClick={() => {
+                    onClick={async () => {
                       const itemToAdd = suggested_cart_items?.[0] || { name: "Baby Supplies", price: "$24.99" };
+                      
+                      // Optimistic UI Update
                       setCartItems(prev => [...prev, itemToAdd]);
                       toast.dismiss(t);
                       toast.success(`Added ${itemToAdd.name} to Cart`, {
                         position: "bottom-center"
                       });
+
+                      // Save to DynamoDB
+                      try {
+                        await fetch("/api/cart", {
+                          method: "POST",
+                          body: JSON.stringify({ item: itemToAdd, profile: activeProfile.toLowerCase() })
+                        });
+                      } catch (e) {}
                     }}
                   >
                     Add to Cart
@@ -417,11 +478,22 @@ export default function Home() {
                   }).map((log) => (
                     <li key={log.id} className="p-4 flex flex-col gap-1 hover:bg-gray-50 transition-colors group">
                       <div className="flex justify-between items-start">
-                        <span className={`font-medium text-sm ${log.type === 'alert' ? 'text-red-600' : log.type === 'family_connect' ? 'text-purple-600' : log.type === 'commerce' ? 'text-amazon-orange' : log.type === 'trigger' ? 'text-gray-500 text-xs font-bold uppercase tracking-wider' : 'text-gray-900'}`}>
-                          {log.message}
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs text-gray-400 font-medium">{log.time}</span>
+                        </div>
+                        <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${
+                          log.type === "trigger" ? "bg-gray-100 text-gray-600" :
+                          log.type === "alert" ? "bg-red-100 text-red-700" :
+                          log.type === "commerce" ? "bg-blue-100 text-blue-700" :
+                          log.type === "family_connect" ? "bg-purple-100 text-purple-700" :
+                          "bg-green-100 text-green-700"
+                        }`}>
+                          {log.type.toUpperCase()}
                         </span>
-                        <span className="text-[11px] text-gray-400 font-mono whitespace-nowrap ml-4">{log.time}</span>
                       </div>
+                      <span className={`font-medium text-sm ${log.type === 'alert' ? 'text-red-600' : log.type === 'family_connect' ? 'text-purple-600' : log.type === 'commerce' ? 'text-amazon-orange' : log.type === 'trigger' ? 'text-gray-500 text-xs font-bold uppercase tracking-wider' : 'text-gray-900'}`}>
+                        {log.message}
+                      </span>
                     </li>
                   ))}
                 </ul>

@@ -16,7 +16,7 @@ export async function POST(request: Request) {
     }> | null = null;
 
     if (body.classification === "baby_crying") {
-      
+      action_type = "commerce";
       message = "Detected a baby crying. Might need some supplies.";
       suggested_cart_items = [
         {
@@ -61,9 +61,11 @@ Analyze the event given the context. Be creative, genuinely helpful, and EMPATHE
 
 Rules for action_type:
 - "family_connect": Use this if ${body.sourceProfile} is lonely, struggling, stressed, or needs a family check-in.
-- "commerce": Use this if the event relates to a baby crying or running out of supplies (unless it is the middle of the night, in which case use "info"). You MUST include suggested_cart_items for this.
-- "alert": Use this if there is a safety issue (like cooker whistle).
+- "commerce": Use this if the event relates to a baby crying or running out of supplies (unless it is the middle of the night). You MUST include suggested_cart_items for this.
+- "alert": Use this if there is a safety issue (like cooker whistle), or if the smart home is taking an immediate physical action (like playing a lullaby).
 - "info": Use this for mundane logs (like water motor).
+
+If it is the middle of the night and a baby cries, use action_type "alert" and your message MUST contain the word "lullaby" so the audio system can trigger.
 
 Rules for target_profile (WHO should receive the notification):
 - For "commerce", "alert", or "info" events, the target_profile SHOULD BE ${body.sourceProfile} (the person whose house it happened in) or "everyone".
@@ -127,6 +129,11 @@ Return raw JSON only.
         aiContent = aiContent.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
         const aiDecision = JSON.parse(aiContent);
 
+        // Guardrail: AI sometimes hallucinates target_profile for commerce. Force it to stay at the source.
+        if (aiDecision.action_type === "commerce" || aiDecision.action_type === "alert") {
+           aiDecision.target_profile = body.sourceProfile || "everyone";
+        }
+
         // --- DYNAMODB LOGGING ---
         if (
           process.env.AWS_ACCESS_KEY_ID &&
@@ -157,7 +164,8 @@ Return raw JSON only.
                 time: displayTime,
                 type: aiDecision.action_type,
                 source: body.sourceProfile || "unknown",
-                target: aiDecision.target_profile || "everyone"
+                target: aiDecision.target_profile || "everyone",
+                engine: "groq"
               }
             }));
             console.log("Logged to DynamoDB");
@@ -228,6 +236,11 @@ Return raw JSON only.
 
         const aiDecision = JSON.parse(aiContent);
 
+        // Guardrail: AI sometimes hallucinates target_profile for commerce. Force it to stay at the source.
+        if (aiDecision.action_type === "commerce" || aiDecision.action_type === "alert") {
+           aiDecision.target_profile = body.sourceProfile || "everyone";
+        }
+
         return NextResponse.json({
           success: true,
           data: aiDecision,
@@ -285,7 +298,8 @@ Return raw JSON only.
             time: displayTime,
             type: action_type,
             source: body.sourceProfile || "unknown",
-            target: "everyone"
+            target: "everyone",
+            engine: "mock"
           }
         }));
         console.log("Successfully logged to DynamoDB");
