@@ -37,33 +37,51 @@ export async function POST(request: Request) {
       message = "Routine logged: Water motor turned on.";
     }
 
+    const timeOfDay = body.timeOfDay || "2 PM";
+    const homeState = body.homeState || "quiet";
+
     const prompt = `
-You are the Alexa Ambient Companion brain.
+You are the advanced Alexa Ambient Companion brain. Your job is to act like a truly intelligent and empathetic smart home that adapts to the time of day, the status of the house, and the emotional/physical needs of the residents.
 
-Household context:
-The home is currently quiet.
-It is 2 PM.
+Household Context:
+- Time of Day: ${timeOfDay}
+- Home Status: ${homeState}
+- Event occurred in the house of: ${body.sourceProfile}
 
-Trigger event detected: ${body.classification}.
+Trigger Event Detected: ${body.classification}
 
-Based on this, what proactive action should the smart home take?
+Analyze the event given the context. Be creative, genuinely helpful, and EMPATHETIC.
+1. The person experiencing the event is the person whose house it occurred in (${body.sourceProfile}). They are the "victim" or subject of the event.
+2. If it is late at night (e.g., 3 AM) or everyone is sleeping, prioritize quiet, ambient smart home actions.
+3. If it is daytime and there is a baby need, suggest buying supplies.
+4. If it is a safety hazard (e.g., pressure cooker whistle), alert the user immediately.
+5. If the event indicates ${body.sourceProfile} is struggling (e.g., repeatedly saying "Kya?", increasing TV volume, sounding lonely, or highly stressed), show EMPATHY. You MUST notify their family members, NOT the person experiencing it.
 
-Rules for classification:
-- If the event relates to running out of supplies or baby needs (like "baby_crying"), return action_type "commerce" and suggest relevant products to buy.
-- If the event is a safety hazard or requires immediate attention (like "pressure_cooker_whistle"), return action_type "alert".
-- For mundane tasks (like "water_motor_on"), return action_type "info".
+Rules for action_type:
+- "family_connect": Use this if ${body.sourceProfile} is lonely, struggling, stressed, or needs a family check-in.
+- "commerce": Use this if the event relates to a baby crying or running out of supplies (unless it is the middle of the night, in which case use "info"). You MUST include suggested_cart_items for this.
+- "alert": Use this if there is a safety issue (like cooker whistle).
+- "info": Use this for mundane logs (like water motor).
+
+Rules for target_profile (WHO should receive the notification):
+- For "commerce", "alert", or "info" events, the target_profile SHOULD BE ${body.sourceProfile} (the person whose house it happened in) or "everyone".
+- ONLY if it is an empathy/family_connect event, the target_profile MUST NOT be ${body.sourceProfile}. Instead:
+   - If sourceProfile is "parents", target_profile should be "children".
+   - If sourceProfile is "children", target_profile should be "parents".
+   - If sourceProfile is "partner", target_profile should be "partner" (the other partner).
 
 Return ONLY a valid JSON object with keys:
-- action_type (must be "commerce", "alert", or "info")
-- message (a short 1 sentence UI message)
-- suggested_cart_items (array of objects with "name" and "price" if commerce, otherwise null)
+- action_type (must be "commerce", "alert", "family_connect", or "info")
+- target_profile (must be "children", "partner", "parents", or "everyone")
+- message (A short 1-2 sentence UI message describing what you are doing. E.g., "${body.sourceProfile} is struggling to hear the TV. Suggesting you check in and drop a voice note.")
+- suggested_cart_items (Array of objects with "name" and "price" if action_type is "commerce", otherwise null)
 
 Do not wrap in markdown blocks.
 Return raw JSON only.
 `;
 
     // =========================================================================
-    // GROQ API
+    // GROQ API (Primary - Blazing Fast)
     // =========================================================================
 
     if (
@@ -90,7 +108,7 @@ Return raw JSON only.
                   content: prompt,
                 },
               ],
-              model: "groq/compound",
+              model: "llama-3.1-8b-instant",
               temperature: 0.1,
             }),
           }
@@ -98,21 +116,69 @@ Return raw JSON only.
 
         if (!groqResponse.ok) {
           const errorDetails = await groqResponse.text();
-
-          console.error(
-            "GROQ REJECTION DETAILS:",
-            errorDetails
-          );
-
-          throw new Error(
-            `Groq API error: ${groqResponse.status} - ${errorDetails}`
-          );
+          throw new Error(`Groq API error: ${groqResponse.status} - ${errorDetails}`);
         }
 
         const groqData = await groqResponse.json();
+        let aiContent = groqData?.choices?.[0]?.message?.content?.trim() || "";
+
+        aiContent = aiContent.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+        const aiDecision = JSON.parse(aiContent);
+
+        return NextResponse.json({
+          success: true,
+          data: aiDecision,
+          source: "groq",
+        });
+      } catch (err) {
+        console.error("Groq failed, falling back:", err);
+      }
+    }
+
+    // =========================================================================
+    // GEMINI API (Fallback)
+    // =========================================================================
+
+    if (
+      process.env.GEMINI_API_KEY &&
+      process.env.GEMINI_API_KEY !== "paste_your_gemini_key_here"
+    ) {
+      try {
+        const geminiResponse = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${process.env.GEMINI_API_KEY}`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              contents: [
+                {
+                  parts: [
+                    {
+                      text: prompt,
+                    },
+                  ],
+                },
+              ],
+              generationConfig: {
+                temperature: 0.1,
+                responseMimeType: "application/json",
+              },
+            }),
+          }
+        );
+
+        if (!geminiResponse.ok) {
+          const errorDetails = await geminiResponse.text();
+          console.error("GEMINI REJECTION DETAILS:", errorDetails);
+          throw new Error(`Gemini API error: ${geminiResponse.status} - ${errorDetails}`);
+        }
+
+        const geminiData = await geminiResponse.json();
 
         let aiContent =
-          groqData?.choices?.[0]?.message?.content?.trim() || "";
+          geminiData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
 
         // Remove markdown fences if model returns them
         aiContent = aiContent
@@ -121,28 +187,15 @@ Return raw JSON only.
           .replace(/\s*```$/i, "")
           .trim();
 
-        let aiDecision;
-
-        try {
-          aiDecision = JSON.parse(aiContent);
-        } catch (parseError) {
-          console.error(
-            "Failed to parse Groq JSON:",
-            aiContent
-          );
-          throw parseError;
-        }
+        const aiDecision = JSON.parse(aiContent);
 
         return NextResponse.json({
           success: true,
           data: aiDecision,
-          source: "groq",
+          source: "gemini",
         });
       } catch (err) {
-        console.error(
-          "Groq failed, falling back to mock response:",
-          err
-        );
+        console.error("Gemini failed, falling back to mock response:", err);
       }
     }
 

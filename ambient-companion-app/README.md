@@ -5,6 +5,8 @@ This is the prototype for the Amazon HackOn submission. The Ambient Companion li
 ## 🚀 Features
 - **Interactive Simulator**: A frontend dashboard built with Next.js to simulate audio events without hardware.
 - **Dynamic AI Decision Engine**: Powered by Groq (Llama 3) to analyze household context (e.g. time of day) and trigger the correct response.
+- **Dynamic Context Panel (Phase 2)**: Simulates different times of day (e.g., 3:00 AM vs 2:00 PM) so the AI adapts its decisions (e.g., dimming lights vs suggesting diapers).
+- **Amazon Cart Drawer (Phase 2)**: Fully mocked shopping cart slide-out that stores the items suggested by the AI.
 - **Smart UI Notifications**: Elegant, Amazon-styled toast notifications for Alerts, Information, and Commerce/Shopping Cart additions.
 - **Fail-safe Fallbacks**: Fully functional even without API keys via a robust mock-data pipeline, guaranteeing a crash-free demo on stage.
 
