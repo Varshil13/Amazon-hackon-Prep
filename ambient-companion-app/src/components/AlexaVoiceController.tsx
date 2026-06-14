@@ -88,6 +88,9 @@ export function AlexaVoiceController({
       "Microsoft Jenny Online (Natural) - English (United States)",
       "Microsoft Zira - English (United States)",
       "Google US English",
+      "Samantha",  // macOS
+      "Karen",     // macOS
+      "Moira",     // macOS
     ];
 
     const pickVoice = () => {
