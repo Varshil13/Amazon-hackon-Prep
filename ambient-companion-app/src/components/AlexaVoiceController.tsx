@@ -121,6 +121,9 @@ export function AlexaVoiceController({
   }, []);
 
   // ── Core: POST voice command → /api/event ──────────────
+  // Architecture note: This component owns MICROPHONE + WAKE WORD only.
+  // TTS for AI responses is owned entirely by page.tsx via onAIResponse.
+  // This component only speaks for LOCAL mic-level errors (no network involved).
   const sendVoiceCommand = useCallback(
     async (command: string) => {
       try {
@@ -135,29 +138,35 @@ export function AlexaVoiceController({
         });
         const data = await res.json();
         if (data.success) {
-          const { message, reasoning, action_type, device_command, device_commands } = data.data;
+          const { message, reasoning, action_type, device_commands } = data.data;
 
-          // 1. Speak the AI's response via TTS
-          speak(message);
-
-          // 2. Update reasoning panel in parent
+          // 1. Propagate to parent — parent speaks via setReasoningAndSpeak().
+          //    Do NOT call speak() here; that would race with the parent's cancel().
           onAIResponse?.(message, reasoning || "");
 
-          // 3. If it's a device command, execute it (with optional delay)
-          if (action_type === "voice_command_execute") {
-            const cmds = device_commands || [];
-            if (device_command) cmds.push(device_command); // backward compatibility
-            
-            cmds.forEach((cmd: any) => {
-              if (cmd.deviceId) {
-                const delayMs = (cmd.delay_minutes || 0) * 60000;
-                onDeviceCommand(cmd.deviceId as DeviceId, !!cmd.state, delayMs);
+          // 2. Execute device commands
+          if (action_type === "voice_command_execute" && Array.isArray(device_commands)) {
+            device_commands.forEach((cmd: { deviceId: string; state: boolean; target_time?: string; delay_minutes?: number }) => {
+              if (!cmd.deviceId) return;
+              let delayMs = 0;
+              if (cmd.target_time && cmd.target_time !== "now") {
+                const [th, tm] = cmd.target_time.split(":").map(Number);
+                const targetTotal = th * 60 + tm;
+                const [ch, cm] = (houseStateRef.current.time || "00:00").split(":").map(Number);
+                const currentTotal = ch * 60 + cm;
+                let diffMinutes = targetTotal - currentTotal;
+                if (diffMinutes <= 0) diffMinutes += 1440;
+                delayMs = diffMinutes * 60000;
+              } else if (cmd.delay_minutes && cmd.delay_minutes > 0) {
+                delayMs = cmd.delay_minutes * 60000;
               }
+              onDeviceCommand(cmd.deviceId as DeviceId, !!cmd.state, delayMs);
             });
           }
         }
       } catch {
-        speak("Sorry, I couldn't process that command. Please try again.");
+        // Local mic error — safe to speak here (no parent TTS in flight for errors)
+        speak("Sorry, I couldn't reach Alexa. Please try again.");
       }
     },
     [speak, onAIResponse, onDeviceCommand]

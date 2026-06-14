@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { dynamoDb } from "@/lib/dynamodb";
-import { ScanCommand } from "@aws-sdk/lib-dynamodb";
+import { ScanCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 
 export async function GET() {
   if (!process.env.AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID === "paste_your_access_key_here" || process.env.AWS_ACCESS_KEY_ID === "dummy") {
@@ -24,5 +24,23 @@ export async function GET() {
       { success: false, error: error.message },
       { status: 500 }
     );
+  }
+}
+
+export async function DELETE() {
+  if (!process.env.AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID === "paste_your_access_key_here") {
+    return NextResponse.json({ success: false, reason: "No AWS keys configured" });
+  }
+  try {
+    const data = await dynamoDb.send(new ScanCommand({ TableName: "HouseholdLogs" }));
+    await Promise.all(
+      (data.Items || []).map((item) =>
+        dynamoDb.send(new DeleteCommand({ TableName: "HouseholdLogs", Key: { id: item.id } }))
+      )
+    );
+    return NextResponse.json({ success: true, deleted: data.Items?.length ?? 0 });
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return NextResponse.json({ success: false, error: msg }, { status: 500 });
   }
 }

@@ -132,19 +132,14 @@ function parseActionToDevice(
 export default function Home() {
   const [houseState, setHouseState] = useState<HouseState>({
     devices: initialDevices,
-    time: "06:00",
+    time: "00:00",
     audioEvents: [],
   });
   const [isThinking, setIsThinking]   = useState(false);
   const [reasoning, setReasoning]     = useState({ message: "Waiting for activity...", detail: "" });
   const [suggested, setSuggested]     = useState<SuggestedAutomation[]>([]);
   const [active, setActive]           = useState<ActiveAutomation[]>([]);
-  const [patterns, setPatterns]       = useState<RoutinePattern[]>([
-    { event: "water_motor",             occurrences: 5, typical_window: "Morning",   confidence: "high" },
-    { event: "morning_puja_bell",       occurrences: 4, typical_window: "Morning",   confidence: "high" },
-    { event: "pressure_cooker_whistle", occurrences: 3, typical_window: "Afternoon", confidence: "medium" },
-    { event: "study_hour_silence",      occurrences: 3, typical_window: "Evening",   confidence: "medium" },
-  ]);
+  const [patterns, setPatterns]       = useState<RoutinePattern[]>([]);
   const [pendingAutomationAsk, setPendingAutomationAsk] = useState<string | null>(null);
   const [toast, setToast]             = useState<{ message: string; type: "success" | "error" | "info" } | null>(null);
   const [isSeedLoading, setIsSeedLoading] = useState(false);
@@ -152,6 +147,11 @@ export default function Home() {
   const [pendingCommands, setPendingCommands] = useState<{ deviceId: DeviceId; state: boolean; targetMinutes: number }[]>([]);
   // Tracks the slider-minute at which each device was turned ON — used for anomaly detection
   const [deviceOnTimes, setDeviceOnTimes] = useState<Partial<Record<DeviceId, number>>>({});
+  const [currentDay, setCurrentDay] = useState(1);
+  // Queue of automation actions for today, sorted by time
+  const [dailyQueue, setDailyQueue] = useState<{ time: string; device: DeviceId; action: boolean }[]>([]);
+  const dailyQueueRef = useRef(dailyQueue);
+  useEffect(() => { dailyQueueRef.current = dailyQueue; }, [dailyQueue]);
 
   const debounceRef          = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestStateRef       = useRef(houseState);
@@ -273,17 +273,7 @@ export default function Home() {
       return text.includes(window);
     });
 
-    if (!matched) {
-      // Debug: log what each automation resolved to
-      if (activeRef.current.length > 0) {
-        console.log("[checkAutomations] currentMinutes:", currentMinutes, "active:", activeRef.current.map(a => ({
-          name: a.name,
-          trigger: a.trigger,
-          start: getAutomationStartMinutes(a),
-        })));
-      }
-      return;
-    }
+    if (!matched) return;
     // Cooldown — don't re-fire the same automation twice
     if (lastAnnouncedAutoRef.current === matched.id) return;
     lastAnnouncedAutoRef.current = matched.id;
@@ -355,26 +345,51 @@ export default function Home() {
       const [h, m] = latestStateRef.current.time.split(":").map(Number);
       return h * 60 + m;
     })();
-    setDeviceOnTimes((prev) => {
-      const next = { ...prev };
-      if (!latestStateRef.current.devices[deviceId]) {
-        // turning ON — record current slider time
-        next[deviceId] = currentMinutes;
-      } else {
-        // turning OFF — remove the on-time
+    const isCurrentlyOn = latestStateRef.current.devices[deviceId];
+    const toHHMM = (m: number) => `${String(Math.floor(m/60)).padStart(2,"0")}:${String(m%60).padStart(2,"0")}`;
+
+    // 1. Log to PossibleAutomations — outside setState to avoid duplicate calls
+    fetch("/api/possible-automations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        device: deviceId,
+        action: isCurrentlyOn ? "off" : "on",
+        time: toHHMM(currentMinutes),
+        day: currentDay,
+      }),
+    }).catch(() => {});
+
+    // 2. If turning OFF a tracked device → also save the on/off session pair
+    if (isCurrentlyOn) {
+      setDeviceOnTimes((prev) => {
+        if (prev[deviceId] !== undefined) {
+          const onMinutes = prev[deviceId]!;
+          fetch("/api/event/session", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              device: deviceId,
+              on_time: toHHMM(onMinutes),
+              off_time: toHHMM(currentMinutes),
+              duration_minutes: currentMinutes >= onMinutes ? currentMinutes - onMinutes : currentMinutes + 1440 - onMinutes,
+            }),
+          }).catch(() => {});
+        }
+        const next = { ...prev };
         delete next[deviceId];
-      }
-      return next;
-    });
-    setHouseState((prev) => {
-      const next = { ...prev, devices: { ...prev.devices, [deviceId]: !prev.devices[deviceId] } };
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-      debounceRef.current = setTimeout(() => {
-        setDeviceOnTimes((onTimes) => { sendStateToAI(next, onTimes); return onTimes; });
-      }, 800);
-      return next;
-    });
-  }, [sendStateToAI]);
+        return next;
+      });
+    } else {
+      setDeviceOnTimes((prev) => ({ ...prev, [deviceId]: currentMinutes }));
+    }
+
+    // 3. Toggle device state
+    setHouseState((prev) => ({
+      ...prev,
+      devices: { ...prev.devices, [deviceId]: !prev.devices[deviceId] },
+    }));
+  }, []);
 
   // ── Handle device command from AlexaVoiceController ────
   // FROM main-2: delayed commands use time-slider targeting, not real setTimeout
@@ -478,6 +493,48 @@ export default function Home() {
     setIsSeedLoading(false);
   }, [showToast]);
 
+  // ── Day change — advance/retreat day, call day-start LLM, build queue ──
+  const handleDayChange = useCallback(async (newDay: number) => {
+    if (newDay < 1) return;
+    setCurrentDay(newDay);
+    // Reset time to midnight
+    setHouseState((prev) => ({ ...prev, time: "00:00", audioEvents: [] }));
+    setReasoning({ message: `Day ${newDay} starting... Alexa is analyzing patterns.`, detail: "" });
+
+    try {
+      const res = await fetch("/api/day-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ day: newDay }),
+      });
+      const data = await res.json();
+      if (data.success && data.automations?.length > 0) {
+        // Build today's queue from the automations LLM returned
+        const queue: { time: string; device: DeviceId; action: boolean }[] = [];
+        data.automations.forEach((auto: { device: string; schedule: { action: string; time: string }[] }) => {
+          auto.schedule.forEach((s) => {
+            queue.push({ time: s.time, device: auto.device as DeviceId, action: s.action === "on" });
+          });
+        });
+        queue.sort((a, b) => a.time.localeCompare(b.time));
+        setDailyQueue(queue);
+        setActive(data.automations.map((a: { id: string; name: string; trigger: string; action: string; reasoning: string }) => a));
+        const msg = `Day ${newDay} routine ready. ${data.automations.length} automation${data.automations.length > 1 ? "s" : ""} scheduled based on your habits.`;
+        speak(msg);
+        setReasoning({ message: msg, detail: data.automations.map((a: { name: string }) => a.name).join(", ") });
+      } else {
+        const msg = newDay < 3
+          ? `Day ${newDay}. Keep using devices manually — I'm learning your patterns.`
+          : `Day ${newDay}. Not enough consistent patterns yet to automate.`;
+        setDailyQueue([]);
+        speak(msg);
+        setReasoning({ message: msg, detail: "" });
+      }
+    } catch {
+      setReasoning({ message: `Day ${newDay} started.`, detail: "" });
+    }
+  }, [speak]);
+
   // ── Time slider — FROM main-2 ──────────────────────────
   // Full 24h range (0–1439), time-period greetings, pending command execution, checkAutomations
   const handleTimeChange = useCallback((minutes: number) => {
@@ -485,35 +542,33 @@ export default function Home() {
     const m    = minutes % 60;
     const time = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 
-    // Time-period greetings
-    const period =
-      minutes < 360  ? "midnight" :
-      minutes < 480  ? "morning" :
-      minutes < 720  ? "late_morning" :
-      minutes < 900  ? "afternoon" :
-      minutes < 1020 ? "evening" :
-      minutes < 1200 ? "night" : "late_night";
-
-    const greetings: Record<string, string> = {
-      morning:      "Good morning! It's 6 AM. The house is quiet. Should I start your morning routine?",
-      late_morning: "Good morning! It's a new day. Kitchen devices are ready when you are.",
-      afternoon:    "Good afternoon! Lunch time. Shall I check if the kitchen is in use?",
-      evening:      "Good evening! The family is likely home. Study hours may be starting soon.",
-      night:        "It's evening. TV time perhaps? I'll keep an ear out for any activity.",
-      late_night:   "It's getting late. Most devices should be off. Should I check the house?",
-    };
-
-    if (greetings[period] && lastGreetedPeriodRef.current !== period) {
-      lastGreetedPeriodRef.current = period;
-      speak(greetings[period]);
-      setReasoning({ message: greetings[period], detail: "" });
+    // Fire daily queue items whose time the slider has crossed
+    const queueTriggered: typeof dailyQueue = [];
+    const queueRemaining: typeof dailyQueue = [];
+    dailyQueueRef.current.forEach((item) => {
+      const [ih, im] = item.time.split(":").map(Number);
+      const itemMinutes = ih * 60 + im;
+      if (minutes >= itemMinutes && minutes <= itemMinutes + 15) {
+        queueTriggered.push(item);
+      } else {
+        queueRemaining.push(item);
+      }
+    });
+    if (queueTriggered.length > 0) {
+      setDailyQueue(queueRemaining);
+      queueTriggered.forEach((item) => {
+        const label = DEVICE_CONFIG[item.device]?.label ?? item.device;
+        const msg = `Turning ${item.action ? "on" : "off"} ${label} as part of your daily routine.`;
+        speak(msg);
+        setReasoning({ message: `🤖 ${msg}`, detail: "Automated by Alexa based on learned patterns." });
+      });
     }
 
-    // Fire any pending voice commands that fall within this time window
+    // Fire pending voice commands whose target time the slider has reached
     const triggered: typeof pendingCommands = [];
     const remaining: typeof pendingCommands = [];
     pendingCommandsRef.current.forEach((cmd) => {
-      if (minutes >= cmd.targetMinutes && minutes <= cmd.targetMinutes + 60) {
+      if (minutes >= cmd.targetMinutes && minutes <= cmd.targetMinutes + 15) {
         triggered.push(cmd);
       } else {
         remaining.push(cmd);
@@ -521,23 +576,26 @@ export default function Home() {
     });
     if (triggered.length > 0) {
       setPendingCommands(remaining);
-      showToast("Executed scheduled voice command!", "success");
+      triggered.forEach((cmd) => {
+        const label = DEVICE_CONFIG[cmd.deviceId]?.label ?? cmd.deviceId;
+        const action = cmd.state ? "on" : "off";
+        const msg = `Turning ${action} the ${label} as scheduled.`;
+        speak(msg);
+        setReasoning({ message: `⏰ ${msg}`, detail: "Scheduled voice command executed." });
+      });
     }
 
+    // Update time in state
     setHouseState((prev) => {
       const nextDevices = { ...prev.devices };
       triggered.forEach((cmd) => { nextDevices[cmd.deviceId] = cmd.state; });
-      const next = { ...prev, devices: nextDevices, time };
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-      debounceRef.current = setTimeout(() => {
-        setDeviceOnTimes((onTimes) => { sendStateToAI(next, onTimes); return onTimes; });
-      }, 800);
-      return next;
+      queueTriggered.forEach((item) => { nextDevices[item.device] = item.action; });
+      return { ...prev, devices: nextDevices, time };
     });
 
-    // Check active automations immediately when slider moves
+    // Check active automations when slider moves
     checkAutomations(minutes);
-  }, [sendStateToAI, checkAutomations, speak, showToast]);
+  }, [checkAutomations, speak, showToast]);
 
   const formatTimeDisplay = (time: string) => {
     const [hStr, mStr] = time.split(":");
@@ -599,11 +657,8 @@ export default function Home() {
         /* ── Navbar ── */
         .navbar{background:var(--surface);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;align-items:center;gap:20px;flex-shrink:0;height:56px}
         .nav-brand{font-size:15px;font-weight:700;color:#fff;white-space:nowrap;flex-shrink:0}
-        .nav-slider-wrap{flex:1;display:flex;align-items:center;gap:12px;min-width:0}
-        .time-label{font-size:12px;font-weight:600;color:var(--amber);white-space:nowrap;min-width:72px;text-align:center}
-        input[type="range"]{flex:1;height:4px;accent-color:var(--amber);cursor:pointer;background:var(--border);border-radius:4px}
-        .time-range-labels{display:flex;justify-content:space-between;gap:8px}
-        .time-range-labels span{font-size:10px;color:var(--text-dim);white-space:nowrap}
+        .nav-slider-wrap{flex:1;display:flex;align-items:center;justify-content:center;gap:8px;min-width:0}
+        .time-label{font-size:13px;font-weight:700;color:var(--amber);white-space:nowrap;min-width:90px;text-align:center}
         .nav-right{flex-shrink:0;display:flex;align-items:center;gap:10px}
 
         .seed-btn{height:28px;padding:0 10px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.25);border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;color:var(--amber);display:flex;align-items:center;gap:5px;transition:background .2s,border-color .2s;white-space:nowrap}
@@ -683,23 +738,62 @@ export default function Home() {
       <nav className="navbar">
         <span className="nav-brand">⚡ Alexa Ambient</span>
 
-        {/* Full 24h time slider — FROM main-2 */}
+        {/* Day arrows */}
+        <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+          <button
+            onClick={() => handleDayChange(currentDay - 1)}
+            disabled={currentDay <= 1}
+            style={{ background: "var(--muted)", border: "none", borderRadius: 6, width: 28, height: 28, cursor: currentDay <= 1 ? "not-allowed" : "pointer", color: "var(--text)", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", opacity: currentDay <= 1 ? 0.4 : 1 }}
+            title="Previous day"
+          >◀</button>
+          <span style={{ fontSize: 12, fontWeight: 700, color: "var(--blue)", whiteSpace: "nowrap", minWidth: 52, textAlign: "center" }}>Day {currentDay}</span>
+          <button
+            onClick={() => handleDayChange(currentDay + 1)}
+            style={{ background: "var(--muted)", border: "none", borderRadius: 6, width: 28, height: 28, cursor: "pointer", color: "var(--text)", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center" }}
+            title="Next day"
+          >▶</button>
+        </div>
+
+        {/* Time arrows */}
         <div className="nav-slider-wrap">
-          <span className="time-label">{formatTimeDisplay(houseState.time)}</span>
-          <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
-            <input
-              type="range" min={0} max={1439} step={15}
-              value={timeMinutes}
-              onChange={(e) => handleTimeChange(parseInt(e.target.value))}
-              style={{ flex: 1, height: 4, accentColor: "#f59e0b", cursor: "pointer" }}
-            />
-            <div className="time-range-labels"><span>12:00 AM</span><span>11:59 PM</span></div>
-          </div>
+          <button
+            onClick={() => handleTimeChange(Math.max(0, timeMinutes - 15))}
+            style={{ background: "var(--muted)", border: "none", borderRadius: 6, width: 28, height: 28, cursor: "pointer", color: "var(--text)", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}
+            title="Previous 15 min"
+          >◀</button>
+          <span className="time-label" style={{ minWidth: 90, textAlign: "center" }}>{formatTimeDisplay(houseState.time)}</span>
+          <button
+            onClick={() => handleTimeChange(Math.min(1439, timeMinutes + 15))}
+            style={{ background: "var(--muted)", border: "none", borderRadius: 6, width: 28, height: 28, cursor: "pointer", color: "var(--text)", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}
+            title="Next 15 min"
+          >▶</button>
         </div>
 
         <div className="nav-right">
           <button className="seed-btn" onClick={handleSeed} disabled={isSeedLoading} title="Seed 5 days of realistic household data into DynamoDB">
             {isSeedLoading ? "⏳" : "🌱"} {isSeedLoading ? "Seeding..." : "Seed Demo"}
+          </button>
+          <button
+            className="seed-btn"
+            title="Clear all PossibleAutomations (dry run history)"
+            onClick={async () => {
+              await fetch("/api/possible-automations", { method: "DELETE" });
+              showToast("Dry run history cleared. Ready for new run.", "success");
+            }}
+            style={{ borderColor: "rgba(239,68,68,0.3)", color: "#f87171" }}
+          >
+            🗑 Clear History
+          </button>
+          <button
+            className="seed-btn"
+            title="Clear all HouseholdLogs"
+            onClick={async () => {
+              await fetch("/api/logs", { method: "DELETE" });
+              showToast("Household logs cleared.", "success");
+            }}
+            style={{ borderColor: "rgba(239,68,68,0.3)", color: "#f87171" }}
+          >
+            🗑 Clear Logs
           </button>
           <AlexaVoiceController
             houseState={houseState}

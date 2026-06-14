@@ -78,6 +78,9 @@ export async function POST(request: Request) {
     );
 
     // 1. Short-term memory & 2. Routine profile (Merged Scan)
+    // OPTIMIZATION: Skip DynamoDB scan entirely for voice commands.
+    // Voice commands only need the current house state — not historical patterns.
+    // This saves 3-8s of network round-trip to AWS on every voice interaction.
     let shortTermMemory: { time: string; message: string }[] = [
       { time: "recently", message: "morning_puja_bell detected" },
       { time: "recently", message: "water_motor turned on" },
@@ -89,10 +92,14 @@ export async function POST(request: Request) {
       { event: "pressure_cooker_whistle",  occurrences: 3, typical_window: "Afternoon", confidence: "medium" },
       { event: "study_hour_silence",       occurrences: 3, typical_window: "Evening",   confidence: "medium" },
     ];
+    let sessionSummary: { device: string; sessions: number; mode_on: string | null; mode_off: string | null; typical_duration: number | null }[] = [];
 
-    if (isAwsConfigured) {
+    // Only hit DynamoDB for ambient/proactive events — not for voice commands
+    if (isAwsConfigured && !voiceCommand) {
+      const t0 = Date.now();
       try {
         const data = await dynamoDb.send(new ScanCommand({ TableName: "HouseholdLogs" }));
+        console.log(`[perf] DynamoDB scan: ${Date.now() - t0}ms`);
         const allItems = data.Items || [];
         
         // Short-term memory
@@ -124,6 +131,35 @@ export async function POST(request: Request) {
             return { event, occurrences: g.occurrences, typical_window: maxWindow, confidence };
           });
         }
+
+        // Session pairs — mode aggregation (mode = most common discrete slot)
+        const sessionItems = allItems.filter((i) => i.type === "device_session");
+        if (sessionItems.length > 0) {
+          const sg: Record<string, { on: string[]; off: string[]; dur: number[] }> = {};
+          sessionItems.forEach((i) => {
+            if (!i.device) return;
+            if (!sg[i.device]) sg[i.device] = { on: [], off: [], dur: [] };
+            if (i.on_time)  sg[i.device].on.push(i.on_time);
+            if (i.off_time) sg[i.device].off.push(i.off_time);
+            if (i.duration_minutes) sg[i.device].dur.push(Number(i.duration_minutes));
+          });
+          const modeOf = (arr: string[]) => {
+            const f: Record<string, number> = {};
+            arr.forEach((v) => { f[v] = (f[v] || 0) + 1; });
+            return arr.length ? Object.entries(f).sort((a, b) => b[1] - a[1])[0][0] : null;
+          };
+          sessionSummary = Object.entries(sg)
+            .filter(([, g]) => g.on.length >= 2)
+            .map(([device, g]) => ({
+              device,
+              sessions: g.on.length,
+              mode_on: modeOf(g.on),
+              mode_off: modeOf(g.off),
+              typical_duration: g.dur.length
+                ? parseInt(modeOf(g.dur.map((d) => String(Math.round(d / 15) * 15))) ?? "0")
+                : null,
+            }));
+        }
       } catch (e) { console.error("DynamoDB scan failed:", e); }
     }
 
@@ -133,6 +169,13 @@ export async function POST(request: Request) {
     const routineDesc = routineProfile.map((r) =>
       `- "${r.event}" occurs ${r.occurrences}x, typically ${r.typical_window} (${r.confidence} confidence)`
     ).join("\n");
+
+    const sessionDesc = sessionSummary.length > 0
+      ? "\nDEVICE USAGE SESSIONS (on/off pairs learned, times are modal 15-min slots):\n" +
+        sessionSummary.map((s) =>
+          `- "${s.device}": ${s.sessions} sessions, typically ON at ${s.mode_on ?? "?"}, OFF at ${s.mode_off ?? "?"} (~${s.typical_duration ?? "?"}min)`
+        ).join("\n")
+      : "";
 
     // ── Device on-time context — let the AI decide what's anomalous ──────────
     // Send how long each device has been on; AI decides if it's unusual
@@ -155,70 +198,34 @@ export async function POST(request: Request) {
       ? `\nDEVICE ON-TIME TRACKING (decide if any are anomalous):\n${deviceOnTimeLines.join("\n")}\n`
       : "";
 
-    // ── Pattern matches: current event vs history ──────────────────────────
-    const currentWindow =
-      currentTotal < 480  ? "Morning" :
-      currentTotal < 720  ? "Morning" :
-      currentTotal < 900  ? "Afternoon" :
-      currentTotal < 1020 ? "Afternoon" :
-      currentTotal < 1200 ? "Evening" : "Night";
-
-    const patternMatches: string[] = [];
-
-    // Match audio events against routine profile
-    for (const audioEvt of (effectiveHouseState.audioEvents || [])) {
-      const label = audioEvt.label;
-      const match = routineProfile.find(
-        (r) =>
-          (r.event.toLowerCase().includes(label.toLowerCase()) ||
-            label.toLowerCase().includes(r.event.toLowerCase())) &&
-          r.typical_window === currentWindow &&
-          r.occurrences >= 3
-      );
-      if (match) {
-        patternMatches.push(
-          `✅ PATTERN MATCH: "${label}" detected — matches pattern "${match.event}" (${match.occurrences}x in ${match.typical_window}, ${match.confidence} confidence). Suggest automating this routine.`
-        );
-      }
-    }
-
-    // Match devices just turned ON against routine profile
-    for (const deviceId of devicesOnNow) {
-      if (!(deviceId in deviceOnTimes)) continue; // only recently toggled ON this session
-      const label = deviceId.replace(/_/g, " ");
-      const match = routineProfile.find(
-        (r) =>
-          (r.event.toLowerCase().includes(label) || label.includes(r.event.toLowerCase())) &&
-          r.typical_window === currentWindow &&
-          r.occurrences >= 3
-      );
-      if (match) {
-        patternMatches.push(
-          `✅ PATTERN MATCH: "${label}" turned ON — matches pattern "${match.event}" (${match.occurrences}x in ${match.typical_window}, ${match.confidence} confidence). Suggest automating this routine.`
-        );
-      }
-    }
-
-    // Always suggest automation for any device just turned ON (even without history match)
-    for (const deviceId of devicesOnNow) {
-      const onFor = deviceId in deviceOnTimes
-        ? currentTotal - deviceOnTimes[deviceId]
-        : -1;
-      // Just turned on (less than 2 slider steps = 30 min)
-      if (onFor >= 0 && onFor <= 30 && !patternMatches.some((p) => p.includes(deviceId.replace(/_/g, " ")))) {
-        patternMatches.push(
-          `💡 DEVICE ON: "${deviceId.replace(/_/g, " ")}" was just turned ON at ${currentWindow} time. Consider suggesting an automation for this action if it seems like a routine.`
-        );
-      }
-    }
-
-    const patternSection = patternMatches.length > 0
-      ? `\nPRE-DETECTED PATTERN MATCHES (suggest automation for these):\n${patternMatches.join("\n")}\n`
-      : "";
+    const patternSection = "";
 
     // Inject voice command section when present (Entry Point 3)
+    // Uses device_commands[] EXCLUSIVELY — never the singular device_command.
+    // Each array item: { deviceId, state, delay_minutes }
+    //   delay_minutes=0  → execute immediately
+    //   delay_minutes>0  → schedule for that many minutes later
+    // Compound commands ("turn on X and turn it off at 7 AM") require TWO items in the array.
     const voiceSection = voiceCommand
-      ? `\nVOICE COMMAND FROM USER: "${voiceCommand}"\n\nYou are in VOICE COMMAND MODE. Respond to this command directly.\n- If it asks about time, tell them the current time (${effectiveHouseState.time}) in a friendly way.\n- If it asks to turn on/off a device, set action_type to "voice_command_execute" and populate device_command.\n- If it is a question (weather, time, general info), just answer helpfully in the message field, set action_type to "voice_command_execute", device_command to null.\n- Available deviceIds: bedroom_light, night_light, geyser, ac, bedroom_fan, kitchen_light, induction, microwave, tv, living_fan, living_light, study_ceiling_light, study_lamp, study_fan, water_motor, washing_machine\n`
+      ? `
+VOICE COMMAND FROM USER: "${voiceCommand}"
+
+You are in VOICE COMMAND MODE. Respond to this command directly and helpfully.
+
+RULES:
+- Set action_type to "voice_command_execute" always.
+- ALWAYS include "device_commands" as a JSON array (even if empty).
+- Do NOT include a "device_command" field at all — only "device_commands".
+- For questions (time, weather, general info): answer in "message", set "device_commands": [].
+- For device commands: add one array item per action.
+  - Immediate action: { "deviceId": "...", "state": true, "target_time": "now" }
+  - Delayed action:   { "deviceId": "...", "state": false, "target_time": "07:00" }
+- For compound commands ("turn on X NOW and turn it off at 7 AM"), use TWO items:
+  [ {"deviceId":"microwave","state":true,"target_time":"now"}, {"deviceId":"microwave","state":false,"target_time":"07:00"} ]
+- target_time must be either "now" OR a 24h clock string like "07:00", "13:30", "22:00".
+- Current time is ${effectiveHouseState.time}.
+- Available deviceIds: bedroom_light, night_light, geyser, ac, bedroom_fan, kitchen_light, induction, microwave, tv, living_fan, living_light, study_ceiling_light, study_lamp, study_fan, water_motor, washing_machine
+`
       : "";
 
     const USER_PROMPT = `${houseDesc}
@@ -228,68 +235,111 @@ ${memoryDesc}
 
 ESTABLISHED HOUSEHOLD PATTERNS:
 ${routineDesc}
+${sessionDesc}
 ${deviceOnTimeSection}${patternSection}
 Profile context: ${sourceProfile}
 ${voiceSection}
-Decide the single most helpful proactive action. Respond with ONLY raw JSON (no markdown):
+Decide the single most helpful proactive action. Respond with ONLY raw JSON (no markdown, no extra text):
 {
   "action_type": "routine_suggestion" | "alert" | "family_connect" | "info" | "anomaly" | "voice_command_execute",
   "target_profile": "parents" | "children" | "partner" | "everyone",
   "message": "1-2 sentence warm helpful message",
   "reasoning": "1 sentence: why you chose this action",
   "suggested_automation": { "name": "string", "trigger": "string", "action": "string" } | null,
-  "device_command": { "deviceId": "string", "state": true, "delay_minutes": 0 } | null
+  "device_commands": []
 }
 
-action_type: routine_suggestion=pattern worth automating, alert=safety/urgent, family_connect=family check needed, anomaly=unusual activity, info=routine log, voice_command_execute=direct spoken command from user
-For voice_command_execute: set device_command.deviceId to exact device, state=true for on/false for off, delay_minutes=0 for immediate. Set device_command to null for non-device commands.`;
+action_type guide: routine_suggestion=pattern worth automating, alert=safety/urgent, family_connect=family care needed, anomaly=unusual activity, info=routine log, voice_command_execute=direct spoken command.
+device_commands: always an array. Empty [] for non-device actions. Each item: { "deviceId": string, "state": boolean, "target_time": "now" | "HH:MM" }`;
 
-    // 4. Call Groq
+
+    // 4. Call AI — 3-tier priority system
+    //    Tier 1: Local LM Studio / Gemma 4 (free, no rate limits, runs on GPU)
+    //    Tier 2: Groq cloud (automatic fallback if local model is offline)
+    //    Tier 3: Hardcoded stub (last resort — keeps the app alive with no AI)
     let aiDecision: {
       action_type: string;
       target_profile: string;
       message: string;
       reasoning: string;
       suggested_automation: { name: string; trigger: string; action: string } | null;
+      device_commands: { deviceId: string; state: boolean; delay_minutes: number }[];
+      device_command?: { deviceId: string; state: boolean; delay_minutes?: number } | null;
     } | null = null;
 
-    if (process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "paste_your_groq_key_here") {
+    // ── Shared: call any OpenAI-compatible endpoint ───────────────────────────
+    const callLLM = async (baseUrl: string, model: string, apiKey?: string) => {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+      const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            { role: "user",   content: USER_PROMPT   },
+          ],
+          model,
+          temperature: 0.2,
+          max_tokens: 512,
+          stream: false,
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      const data = await res.json();
+      let raw = data?.choices?.[0]?.message?.content?.trim() || "";
+      raw = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+      return JSON.parse(raw);
+    };
+
+    // ── Shared: normalize device_commands[] regardless of LLM output shape ───
+    const normalize = (d: NonNullable<typeof aiDecision>) => {
+      const arr: { deviceId: string; state: boolean; delay_minutes: number }[] =
+        Array.isArray(d.device_commands)
+          ? d.device_commands.map((c) => ({ ...c, delay_minutes: c.delay_minutes ?? 0 }))
+          : [];
+      const singular = (d as any).device_command;
+      if (singular?.deviceId) {
+        const dup = arr.some((c) => c.deviceId === singular.deviceId && c.state === !!singular.state);
+        if (!dup) arr.push({ deviceId: singular.deviceId, state: !!singular.state, delay_minutes: singular.delay_minutes ?? 0 });
+      }
+      d.device_commands = arr;
+      delete (d as any).device_command;
+      return d;
+    };
+
+    // ── Tier 1: Local Gemma 4 (LM Studio) ────────────────────────────────────
+    const localUrl   = process.env.LOCAL_LLM_URL   || "http://127.0.0.1:1234";
+    const localModel = process.env.LOCAL_LLM_MODEL || "gemma-4-e2b-it-qat";
+    try {
+      const result = await callLLM(localUrl, localModel);
+      if (result) { aiDecision = normalize(result); console.log(`[AI] Local (${localModel}) OK`); }
+    } catch (e) {
+      console.warn("[AI] Local model unavailable, trying Groq:", (e as Error).message);
+    }
+
+    // ── Tier 2: Groq cloud fallback ───────────────────────────────────────────
+    if (!aiDecision && process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "paste_your_groq_key_here") {
       try {
-        const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
-          body: JSON.stringify({
-            messages: [
-              { role: "system", content: SYSTEM_PROMPT },
-              { role: "user", content: USER_PROMPT },
-            ],
-            model: "llama-3.3-70b-versatile",
-            temperature: 0.2,
-          }),
-        });
-        if (res.ok) {
-          const groqData = await res.json();
-          let content = groqData?.choices?.[0]?.message?.content?.trim() || "";
-          content = content.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
-          aiDecision = JSON.parse(content);
-        } else {
-          console.error("Groq error:", res.status);
-        }
+        const result = await callLLM("https://api.groq.com/openai", "llama-3.3-70b-versatile", process.env.GROQ_API_KEY);
+        if (result) { aiDecision = normalize(result); console.log("[AI] Groq fallback OK"); }
       } catch (e) {
-        console.error("Groq failed:", e);
+        console.warn("[AI] Groq also failed:", (e as Error).message);
       }
     }
 
-    // 5. Fallback
+    // ── Tier 3: Hardcoded stub ────────────────────────────────────────────────
     if (!aiDecision) {
       aiDecision = {
         action_type: "info",
         target_profile: "everyone",
         message: "Event logged.",
-        reasoning: "No patterns established yet.",
+        reasoning: "No AI available.",
         suggested_automation: null,
+        device_commands: [],
       };
     }
+    if (!Array.isArray(aiDecision.device_commands)) aiDecision.device_commands = [];
 
     // 6. Safety guardrail (post-processing)
     // 6. Safety guardrail — only block if the ACTION TARGET device itself is dangerous
