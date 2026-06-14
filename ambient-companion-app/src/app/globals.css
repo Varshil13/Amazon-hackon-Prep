@@ -130,9 +130,15 @@
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background text-foreground;
+    background: #0f1117;
+    color: #e5e7eb;
+    font-family: 'Inter', system-ui, sans-serif;
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
   html {
-    @apply font-sans;
+    height: 100%;
   }
 }

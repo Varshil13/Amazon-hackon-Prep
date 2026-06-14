@@ -1,579 +1,660 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { useState, useEffect, useRef, useCallback } from "react";
 import dynamic from "next/dynamic";
 
-const TeachableAudioMonitor = dynamic(
-  () => import("@/components/TeachableAudioMonitor").then((mod) => mod.TeachableAudioMonitor),
+// Dynamic imports — both are client-only (browser APIs: Web Audio, TensorFlow.js, SpeechRecognition)
+const YAMNetAudioMonitor = dynamic(
+  () => import("@/components/YAMNetAudioMonitor").then((m) => m.YAMNetAudioMonitor),
   { ssr: false }
 );
-import { Button } from "@/components/ui/button";
-import { Toaster } from "@/components/ui/sonner";
-import { toast } from "sonner";
-import { Bell, ShoppingCart, Activity, ShieldAlert, Zap, Settings, Mic, X, Heart, Phone, Users } from "lucide-react";
+const AlexaVoiceController = dynamic(
+  () => import("@/components/AlexaVoiceController").then((m) => m.AlexaVoiceController),
+  { ssr: false }
+);
 
+// ─── Types ────────────────────────────────────────────────
+type DeviceId =
+  | "bedroom_light" | "night_light" | "geyser" | "ac" | "bedroom_fan"
+  | "kitchen_light" | "induction" | "microwave"
+  | "tv" | "living_fan" | "living_light"
+  | "study_ceiling_light" | "study_lamp" | "study_fan"
+  | "water_motor" | "washing_machine";
+
+type RoomId = "bedroom" | "kitchen" | "living" | "study" | "utility";
+type AlertType = "danger" | "attention" | "info";
+
+interface AudioEvent { roomId: RoomId; type: AlertType; label: string; }
+interface HouseState { devices: Record<DeviceId, boolean>; time: string; audioEvents: AudioEvent[]; }
+
+interface SuggestedAutomation { id: string; name: string; trigger: string; action: string; reasoning: string; }
+interface ActiveAutomation { id: string; name: string; }
+interface RoutinePattern { event: string; occurrences: number; typical_window: string; confidence: string; }
+
+// ─── Static Config ────────────────────────────────────────
+const DEVICE_CONFIG: Record<DeviceId, { label: string; icon: string; room: RoomId }> = {
+  bedroom_light:      { label: "Ceiling Light",   icon: "💡", room: "bedroom" },
+  night_light:        { label: "Night Light",     icon: "🌙", room: "bedroom" },
+  geyser:             { label: "Geyser",          icon: "🚿", room: "bedroom" },
+  ac:                 { label: "AC",              icon: "❄️", room: "bedroom" },
+  bedroom_fan:        { label: "Ceiling Fan",     icon: "fan", room: "bedroom" },
+  kitchen_light:      { label: "Kitchen Light",   icon: "💡", room: "kitchen" },
+  induction:          { label: "Induction",       icon: "🍳", room: "kitchen" },
+  microwave:          { label: "Microwave",       icon: "📦", room: "kitchen" },
+  tv:                 { label: "Smart TV",        icon: "📺", room: "living" },
+  living_fan:         { label: "Ceiling Fan",     icon: "fan", room: "living" },
+  living_light:       { label: "Main Light",      icon: "💡", room: "living" },
+  study_ceiling_light:{ label: "Ceiling Light",   icon: "💡", room: "study" },
+  study_lamp:         { label: "Desk Lamp",       icon: "💡", room: "study" },
+  study_fan:          { label: "Ceiling Fan",     icon: "fan", room: "study" },
+  water_motor:        { label: "Water Motor",     icon: "💧", room: "utility" },
+  washing_machine:    { label: "Washing Machine", icon: "🫧", room: "utility" },
+};
+
+const ROOMS: { id: RoomId; label: string; wide?: boolean; devices: DeviceId[] }[] = [
+  { id: "bedroom", label: "Bedroom",           devices: ["bedroom_light","night_light","geyser","ac","bedroom_fan"] },
+  { id: "kitchen", label: "Kitchen",           devices: ["kitchen_light","induction","microwave"] },
+  { id: "living",  label: "Living Room", wide: true, devices: ["tv","living_fan","living_light"] },
+  { id: "study",   label: "Study Room",        devices: ["study_ceiling_light","study_lamp","study_fan"] },
+  { id: "utility", label: "Utility / Balcony", devices: ["water_motor","washing_machine"] },
+];
+
+const initialDevices = Object.fromEntries(
+  (Object.keys(DEVICE_CONFIG) as DeviceId[]).map((k) => [k, false])
+) as Record<DeviceId, boolean>;
+
+// ─── Fan SVG ──────────────────────────────────────────────
+function FanIcon({ spinning }: { spinning: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 48 48" width="30" height="30" fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      style={spinning ? { animation: "spinFan 1.2s linear infinite", transformOrigin: "center" } : {}}
+    >
+      <style>{`@keyframes spinFan { to { transform: rotate(360deg); } }`}</style>
+      <path d="M24 22 C22 14, 14 10, 10 12 C12 18, 18 22, 24 24Z" fill="currentColor" opacity="0.9"/>
+      <path d="M26 24 C34 22, 38 14, 36 10 C30 12, 26 18, 24 24Z" fill="currentColor" opacity="0.9"/>
+      <path d="M24 26 C26 34, 34 38, 38 36 C36 30, 30 26, 24 24Z" fill="currentColor" opacity="0.9"/>
+      <path d="M22 24 C14 26, 10 34, 12 38 C18 36, 22 30, 24 24Z" fill="currentColor" opacity="0.9"/>
+      <circle cx="24" cy="24" r="3.5" fill="currentColor"/>
+      <circle cx="24" cy="24" r="1.5" fill="#0f1117"/>
+    </svg>
+  );
+}
+
+// ─── Main Page ────────────────────────────────────────────
 export default function Home() {
-  const [logs, setLogs] = useState<{ id: string, message: string, time: string, type: string, source?: string, target?: string, engine?: string }[]>([]);
-  const [isListening, setIsListening] = useState(false);
-  
-  // Phase 2: Dynamic Context State
-  const [timeOfDay, setTimeOfDay] = useState("2:00 PM");
-  const [homeState, setHomeState] = useState("quiet");
-  
-  // Phase 3: Active Profile (View As)
-  const [activeProfile, setActiveProfile] = useState("children");
+  const [houseState, setHouseState] = useState<HouseState>({
+    devices: initialDevices,
+    time: "06:00",
+    audioEvents: [],
+  });
+  const [isThinking, setIsThinking]   = useState(false);
+  const [reasoning, setReasoning]     = useState({ message: "Waiting for activity...", detail: "" });
+  const [suggested, setSuggested]     = useState<SuggestedAutomation[]>([]);
+  const [active, setActive]           = useState<ActiveAutomation[]>([]);
+  const [patterns, setPatterns]       = useState<RoutinePattern[]>([
+    { event: "water_motor",           occurrences: 5, typical_window: "Morning",   confidence: "high" },
+    { event: "morning_puja_bell",     occurrences: 4, typical_window: "Morning",   confidence: "high" },
+    { event: "pressure_cooker_whistle", occurrences: 3, typical_window: "Afternoon", confidence: "medium" },
+    { event: "study_hour_silence",    occurrences: 3, typical_window: "Evening",   confidence: "medium" },
+  ]);
+  const [pendingAutomationAsk, setPendingAutomationAsk] = useState<string | null>(null);
+  const [toast, setToast]             = useState<{ message: string; type: "success" | "error" } | null>(null);
+  const [isSeedLoading, setIsSeedLoading] = useState(false);
 
-  // Phase 2: Amazon Cart State
-  const [cartItems, setCartItems] = useState<{name: string, price: string}[]>([]);
-  const [isCartOpen, setIsCartOpen] = useState(false);
+  const debounceRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestStateRef = useRef(houseState);
+  latestStateRef.current = houseState;
+  const activeRef      = useRef(active);
+  useEffect(() => { activeRef.current = active; }, [active]);
 
-  // Phase 4: Real-time DB Polling for Cross-Browser Sync
+  // ── Toast helper ───────────────────────────────────────
+  const showToast = useCallback((message: string, type: "success" | "error" = "success") => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 3500);
+  }, []);
+
+  // Load patterns from DynamoDB on mount
   useEffect(() => {
-    // If AWS is not connected, at least clear the cart locally when switching profiles to simulate separation
-    setCartItems([]);
+    fetch("/api/routines")
+      .then((r) => r.json())
+      .then((d) => { if (d.success && d.routines?.length) setPatterns(d.routines); })
+      .catch(() => {});
+  }, []);
 
-    const fetchData = async () => {
-      try {
-        const resLogs = await fetch("/api/logs");
-        const dataLogs = await resLogs.json();
-        if (dataLogs.success && dataLogs.logs) {
-          setLogs(dataLogs.logs);
-        }
+  // ── Automation proactive checker (runs every 60s) ──────
+  // Checks accepted automations against current time slider.
+  // Speaks TTS prompt and shows confirmation buttons.
+  useEffect(() => {
+    const checker = setInterval(() => {
+      if (activeRef.current.length === 0) return;
+      const [hStr, mStr] = latestStateRef.current.time.split(":").map(Number);
+      const currentMinutes = hStr * 60 + mStr;
 
-        const resCart = await fetch(`/api/cart?profile=${activeProfile.toLowerCase()}`);
-        const dataCart = await resCart.json();
-        if (dataCart.success && dataCart.cartItems) {
-          setCartItems(dataCart.cartItems);
-        }
-      } catch (err) {
-        // ignore errors if not set up
-      }
-    };
-    
-    // Fetch immediately on profile change
-    fetchData();
+      activeRef.current.forEach((automation) => {
+        const name = automation.name.toLowerCase();
+        let triggerWindow: [number, number] | null = null;
+        if (name.includes("morning"))   triggerWindow = [360, 540];
+        else if (name.includes("afternoon")) triggerWindow = [720, 900];
+        else if (name.includes("evening"))   triggerWindow = [1020, 1200];
+        else if (name.includes("night"))     triggerWindow = [1200, 1380];
 
-    // Poll every 3 seconds
-    const interval = setInterval(fetchData, 3000);
-    return () => clearInterval(interval);
-  }, [activeProfile]);
+        if (!triggerWindow) return;
+        const [start] = triggerWindow;
+        const nearWindowStart = currentMinutes >= start - 15 && currentMinutes <= start + 30;
+        if (!nearWindowStart) return;
 
-  const triggerEvent = async (classification: string, label: string) => {
-    const displayTime = timeOfDay.split(' ').slice(0, 2).join(' '); // Extracts just "2:00 PM" from "2:00 PM (Afternoon)"
+        const speakTts = (text: string) => {
+          if (typeof window === "undefined" || !window.speechSynthesis) return;
+          window.speechSynthesis.cancel();
+          const utt = new SpeechSynthesisUtterance(text);
+          utt.rate = 0.95; utt.pitch = 1.0;
+          window.speechSynthesis.speak(utt);
+        };
 
+        speakTts(`I noticed it's time for your ${automation.name}. Should I activate it now?`);
+        setReasoning({
+          message: `🔔 Time for: ${automation.name}. Should I activate it?`,
+          detail: 'Tap "Yes, do it" below or say "Alexa yes" to confirm.',
+        });
+        setPendingAutomationAsk(automation.id);
+      });
+    }, 60000);
+
+    return () => clearInterval(checker);
+  }, []);
+
+  // ── Entry Point 1 & 2: POST state to AI ───────────────
+  // Called on device toggle (debounced 800ms) and audio event (immediate).
+  const sendStateToAI = useCallback(async (state: HouseState) => {
+    setIsThinking(true);
+    setReasoning((p) => ({ ...p, message: "Thinking..." }));
     try {
-      // Show loading pulse on the Mic icon temporarily
-      setIsListening(true);
-      
-      const response = await fetch("/api/event", {
+      const res = await fetch("/api/event", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          classification, 
-          source: "simulator",
-          timeOfDay,
-          homeState,
-          sourceProfile: activeProfile
-        }),
+        body: JSON.stringify({ houseState: state, sourceProfile: "parents" }),
       });
-      const data = await response.json();
-      setIsListening(false);
-
+      const data = await res.json();
       if (data.success) {
-        const { action_type, message, suggested_cart_items, target_profile } = data.data;
-
-        // ALWAYS log the event, but store source and target so we can filter later
-        const newTriggerLog = {
-          id: Date.now().toString() + "trig",
-          message: `Detected: ${label}`,
-          time: displayTime,
-          type: "trigger",
-          source: activeProfile,
-          target: "everyone"
-        };
-
-        const newResponseLog = {
-          id: Date.now().toString() + "res",
-          message: `AI Action: ${message}`,
-          time: displayTime,
-          type: action_type,
-          source: activeProfile,
-          target: target_profile,
-          engine: data.source || "mock"
-        };
-
-        setLogs((prev) => [newResponseLog, newTriggerLog, ...prev]);
-
-        // Smart Home Action: Play Audio if the AI decides to play a lullaby
-        if (message.toLowerCase().includes("lullaby") || message.toLowerCase().includes("music")) {
-          // Using Web Audio API because it is natively supported by all browsers instantly without network requests
-          try {
-            const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
-            const ctx = new AudioContext();
-            
-            // Play a soothing C Major chord (C, E, G) 3 times
-            const repeats = 3;
-            const delayBetweenStrums = 2.0; // Seconds
-            
-            for (let r = 0; r < repeats; r++) {
-              const timeOffset = r * delayBetweenStrums;
-              
-              [261.63, 329.63, 392.00].forEach((freq, i) => {
-                const osc = ctx.createOscillator();
-                const gain = ctx.createGain();
-                osc.type = "sine";
-                osc.frequency.value = freq;
-                
-                const startTime = ctx.currentTime + timeOffset + (i * 0.2); // Strum effect
-                
-                // Fade out gently like a music box
-                gain.gain.setValueAtTime(0, startTime);
-                gain.gain.linearRampToValueAtTime(0.3, startTime + 0.1);
-                gain.gain.exponentialRampToValueAtTime(0.01, startTime + 1.8);
-                
-                osc.connect(gain);
-                gain.connect(ctx.destination);
-                
-                osc.start(startTime);
-                osc.stop(startTime + 2);
-              });
-            }
-          } catch (e) {
-            console.error("Web Audio API failed:", e);
-          }
-        }
-
-        const normalizedTarget = (target_profile || "").toLowerCase();
-        
-        // EMPATHY RULE for popups: Do NOT show a popup if we are not the target.
-        if (normalizedTarget !== "everyone" && normalizedTarget !== activeProfile.toLowerCase()) {
-           return;
-        }
-
-        if (action_type === "commerce") {
-          toast.custom((t) => (
-            <div className="bg-white border border-gray-200 shadow-xl p-4 flex gap-4 w-[356px] rounded-sm pointer-events-auto transition-all duration-300">
-              <div className="bg-gray-100 w-16 h-16 rounded flex flex-col items-center justify-center text-2xl border border-gray-200 shrink-0">
-                🍼
-              </div>
-              <div className="flex-1">
-                <h4 className="text-amazon-link font-medium text-sm hover:underline cursor-pointer">
-                  {suggested_cart_items?.[0]?.name || "Baby Supplies"}
-                </h4>
-                <p className="text-xs text-gray-500 mt-1">{message}</p>
-                <div className="flex items-center gap-2 mt-1">
-                  <span className="text-amazon-textprimary font-bold text-sm">
-                    {suggested_cart_items?.[0]?.price || "$24.99"}
-                  </span>
-                  <span className="text-xs text-gray-500 bg-gray-100 px-1 py-0.5 rounded">Prime</span>
-                </div>
-                <div className="mt-3">
-                  <Button 
-                    className="bg-amazon-yellow hover:bg-amazon-orange text-black w-full h-8 text-xs font-medium rounded-sm shadow-sm transition-colors"
-                    onClick={async () => {
-                      const itemToAdd = suggested_cart_items?.[0] || { name: "Baby Supplies", price: "$24.99" };
-                      
-                      // Optimistic UI Update
-                      setCartItems(prev => [...prev, itemToAdd]);
-                      toast.dismiss(t);
-                      toast.success(`Added ${itemToAdd.name} to Cart`, {
-                        position: "bottom-center"
-                      });
-
-                      // Save to DynamoDB
-                      try {
-                        await fetch("/api/cart", {
-                          method: "POST",
-                          body: JSON.stringify({ item: itemToAdd, profile: activeProfile.toLowerCase() })
-                        });
-                      } catch (e) {}
-                    }}
-                  >
-                    Add to Cart
-                  </Button>
-                </div>
-              </div>
-            </div>
-          ), { duration: 8000 });
-        } else if (action_type === "alert") {
-          toast.custom((t) => (
-            <div className="bg-white border-l-4 border-red-600 shadow-xl p-4 flex gap-3 w-[356px] rounded-sm pointer-events-auto">
-              <ShieldAlert className="w-5 h-5 text-red-600 shrink-0 mt-0.5 animate-pulse" />
-              <div className="flex-1">
-                <h4 className="text-red-700 font-bold text-sm">Safety Alert</h4>
-                <p className="text-xs text-gray-700 mt-1">{message}</p>
-                <button 
-                  className="mt-3 text-amazon-link text-xs hover:underline font-medium"
-                  onClick={() => toast.dismiss(t)}
-                >
-                  Acknowledge
-                </button>
-              </div>
-            </div>
-          ), { duration: 8000 });
-        } else if (action_type === "family_connect") {
-          toast.custom((t) => (
-            <div className="bg-white border-l-4 border-purple-500 shadow-xl p-4 flex gap-3 w-[356px] rounded-sm pointer-events-auto">
-              <Heart className="w-5 h-5 text-purple-500 shrink-0 mt-0.5 animate-pulse" />
-              <div className="flex-1">
-                <h4 className="text-purple-700 font-bold text-sm">Family Connection</h4>
-                <p className="text-xs text-gray-700 mt-1">{message}</p>
-                <div className="flex gap-2 mt-3">
-                  <Button 
-                    className="bg-purple-100 hover:bg-purple-200 text-purple-800 h-7 px-3 text-xs font-medium rounded-sm shadow-sm transition-colors"
-                    onClick={() => {
-                      toast.dismiss(t);
-                      toast.success("Dropping in on Living Room (Alexa)...");
-                    }}
-                  >
-                    <Phone className="w-3 h-3 mr-1" /> Drop In Now
-                  </Button>
-                </div>
-              </div>
-            </div>
-          ), { duration: 8000 });
-        } else {
-          toast.custom((t) => (
-            <div className="bg-white border-l-4 border-amazon-link shadow-xl p-4 flex gap-3 w-[356px] rounded-sm pointer-events-auto">
-              <Bell className="w-5 h-5 text-amazon-link shrink-0 mt-0.5" />
-              <div className="flex-1">
-                <h4 className="text-amazon-black font-bold text-sm">Activity Logged</h4>
-                <p className="text-xs text-gray-700 mt-1">{message}</p>
-              </div>
-            </div>
-          ), { duration: 4000 });
+        const { message, reasoning: r, action_type, suggested_automation } = data.data;
+        setReasoning({ message, detail: r || "" });
+        if (action_type === "routine_suggestion" && suggested_automation) {
+          setSuggested((prev) => {
+            if (prev.find((a) => a.name === suggested_automation.name)) return prev;
+            return [{ id: Date.now().toString(), ...suggested_automation, reasoning: r }, ...prev];
+          });
         }
       }
-    } catch (error) {
-      setIsListening(false);
-      toast.error("Failed to process event");
+    } catch {
+      setReasoning({ message: "Could not reach AI.", detail: "Check API connection." });
     }
+    setIsThinking(false);
+  }, []);
+
+  // ── Device toggle (Entry Point 1) ──────────────────────
+  const toggleDevice = useCallback((deviceId: DeviceId) => {
+    setHouseState((prev) => {
+      const next = { ...prev, devices: { ...prev.devices, [deviceId]: !prev.devices[deviceId] } };
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      debounceRef.current = setTimeout(() => sendStateToAI(next), 800);
+      return next;
+    });
+  }, [sendStateToAI]);
+
+  // ── Handle device command from AlexaVoiceController ────
+  // Supports optional delay (e.g. "turn off kitchen light in 10 minutes")
+  const handleDeviceCommand = useCallback((deviceId: DeviceId, state: boolean, delayMs: number) => {
+    const applyToggle = () =>
+      setHouseState((prev) => ({
+        ...prev,
+        devices: { ...prev.devices, [deviceId]: state },
+      }));
+
+    if (delayMs > 0) {
+      setTimeout(applyToggle, delayMs);
+    } else {
+      applyToggle();
+    }
+  }, []);
+
+  // ── Handle AI response from voice controller ────────────
+  // Updates the reasoning panel so the judge can see what Alexa decided.
+  const handleVoiceAIResponse = useCallback((message: string, detail: string) => {
+    setReasoning({ message, detail });
+  }, []);
+
+  // ── Seed demo data (for presentation resets) ───────────
+  const handleSeed = useCallback(async () => {
+    setIsSeedLoading(true);
+    try {
+      const res  = await fetch("/api/seed?force=true");
+      const data = await res.json();
+      if (data.success) {
+        showToast(data.message || "Demo data seeded!", "success");
+        // Refresh patterns panel
+        fetch("/api/routines")
+          .then((r) => r.json())
+          .then((d) => { if (d.success && d.routines?.length) setPatterns(d.routines); })
+          .catch(() => {});
+      } else {
+        showToast(data.reason || data.error || "Seed failed", "error");
+      }
+    } catch {
+      showToast("Network error — check connection", "error");
+    }
+    setIsSeedLoading(false);
+  }, [showToast]);
+
+  // ── Time slider ────────────────────────────────────────
+  const handleTimeChange = useCallback((minutes: number) => {
+    const h    = Math.floor(minutes / 60);
+    const m    = minutes % 60;
+    const time = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+    setHouseState((prev) => {
+      const next = { ...prev, time };
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      debounceRef.current = setTimeout(() => sendStateToAI(next), 800);
+      return next;
+    });
+  }, [sendStateToAI]);
+
+  const formatTimeDisplay = (time: string) => {
+    const [hStr, mStr] = time.split(":");
+    const h    = parseInt(hStr);
+    const ampm = h < 12 ? "AM" : "PM";
+    const h12  = h === 0 ? 12 : h > 12 ? h - 12 : h;
+    return `${String(h12).padStart(2, "0")}:${mStr} ${ampm}`;
   };
 
-  return (
-    <div className="min-h-screen bg-amazon-bgmain font-sans text-amazon-textprimary relative">
-      {/* Top Navigation */}
-      <header className="bg-amazon-black text-white p-4 flex items-center justify-between sticky top-0 z-40 shadow-sm">
-        <div className="flex items-center gap-2">
-          <Zap className="text-amazon-orange w-6 h-6" />
-          <h1 className="text-xl font-bold tracking-tight">Alexa Ambient Companion</h1>
-        </div>
-        <div className="flex items-center gap-4">
-          <select 
-            className="bg-amazon-navy border border-gray-600 rounded px-2 py-1 text-xs text-white outline-none cursor-pointer"
-            value={activeProfile}
-            onChange={(e) => setActiveProfile(e.target.value)}
-          >
-            <option value="parents">View As: Parents (Living Room)</option>
-            <option value="children">View As: Son (Seattle)</option>
-            <option value="partner">View As: Partner</option>
-            <option value="everyone">View As: Everyone</option>
-          </select>
-          <div 
-            className="flex items-center gap-1 cursor-pointer hover:text-amazon-orange transition-colors relative"
-            onClick={() => setIsCartOpen(!isCartOpen)}
-          >
-            <ShoppingCart className="w-5 h-5" />
-            {cartItems.length > 0 && (
-              <span className="absolute -top-2 -left-2 bg-amazon-orange text-black font-bold text-[10px] w-4 h-4 flex items-center justify-center rounded-full">
-                {cartItems.length}
-              </span>
-            )}
-            <span className="font-medium hidden sm:inline">Cart</span>
-          </div>
-          <Settings className="w-5 h-5 text-white cursor-pointer hover:text-gray-300" />
-        </div>
-      </header>
+  const timeMinutes = (() => {
+    const [h, m] = houseState.time.split(":").map(Number);
+    return h * 60 + m;
+  })();
 
-      {/* Sub Navigation */}
-      <div className="bg-amazon-navy text-white px-4 py-2 flex gap-4 text-sm font-medium overflow-x-auto whitespace-nowrap">
-        <span className="cursor-pointer hover:text-amazon-orange">Today's Insights</span>
-        <span className="cursor-pointer hover:text-amazon-orange">Family Care</span>
-        <span className="cursor-pointer hover:text-amazon-orange">Routines</span>
-        <span className="cursor-pointer hover:text-amazon-orange">Safety</span>
+  // ── Entry Point 2: YAMNet audio event handler ──────────
+  // Called by YAMNetAudioMonitor when a sustained sound is confirmed.
+  // Fires immediately (no debounce) to /api/event.
+  const handleAudioEvent = useCallback((classification: string) => {
+    const roomMap: Partial<Record<string, { roomId: RoomId; type: AlertType }>> = {
+      baby_crying:             { roomId: "bedroom", type: "attention" },
+      glass_break:             { roomId: "living",  type: "danger" },
+      smoke_alarm:             { roomId: "kitchen", type: "danger" },
+      pressure_cooker_whistle: { roomId: "kitchen", type: "attention" },
+      washing_machine_done:    { roomId: "utility", type: "info" },
+      doorbell:                { roomId: "living",  type: "info" },
+      morning_puja_bell:       { roomId: "bedroom", type: "info" },
+      water_motor_on:          { roomId: "utility", type: "info" },
+      study_hour_silence:      { roomId: "study",   type: "info" },
+      power_cut:               { roomId: "living",  type: "attention" },
+      evening_conversation:    { roomId: "living",  type: "info" },
+    };
+    const mapped     = roomMap[classification] ?? { roomId: "living" as RoomId, type: "info" as AlertType };
+    const audioEvent: AudioEvent = { roomId: mapped.roomId, type: mapped.type, label: classification };
+
+    setHouseState((prev) => {
+      const next = { ...prev, audioEvents: [audioEvent] };
+      sendStateToAI(next); // Immediate — no debounce for audio
+      return next;
+    });
+
+    // Clear room flash after 8s
+    setTimeout(() => {
+      setHouseState((prev) => ({ ...prev, audioEvents: [] }));
+    }, 8000);
+  }, [sendStateToAI]);
+
+  // ── Room alert CSS class ───────────────────────────────
+  const getRoomAlertClass = (roomId: RoomId) => {
+    const ev = houseState.audioEvents.find((e) => e.roomId === roomId);
+    if (!ev) return "";
+    return ev.type === "danger"
+      ? "room-alert-danger"
+      : ev.type === "attention"
+      ? "room-alert-attention"
+      : "room-alert-info";
+  };
+
+  // ─────────────────────────────────────────────────────────
+  return (
+    <>
+      <style>{`
+        *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+        :root{
+          --bg:#0f1117;--surface:#1a1d27;--border:#2a2d3e;
+          --muted:#374151;--text:#e5e7eb;--text-dim:#6b7280;
+          --amber:#f59e0b;--green:#10b981;--blue:#3b82f6;--red:#ef4444;
+        }
+        body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;display:flex;flex-direction:column}
+
+        /* ── Navbar ── */
+        .navbar{background:var(--surface);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;align-items:center;gap:20px;flex-shrink:0;height:56px}
+        .nav-brand{font-size:15px;font-weight:700;color:#fff;white-space:nowrap;flex-shrink:0}
+        .nav-slider-wrap{flex:1;display:flex;align-items:center;gap:12px;min-width:0}
+        .time-label{font-size:12px;font-weight:600;color:var(--amber);white-space:nowrap;min-width:72px;text-align:center}
+        input[type="range"]{flex:1;height:4px;accent-color:var(--amber);cursor:pointer;background:var(--border);border-radius:4px}
+        .time-range-labels{display:flex;justify-content:space-between;gap:8px}
+        .time-range-labels span{font-size:10px;color:var(--text-dim);white-space:nowrap}
+        .nav-right{flex-shrink:0;display:flex;align-items:center;gap:10px}
+
+        /* Seed Demo button — small, amber-tinted, not prominent */
+        .seed-btn{
+          height:28px;padding:0 10px;
+          background:rgba(245,158,11,0.08);
+          border:1px solid rgba(245,158,11,0.25);
+          border-radius:6px;cursor:pointer;
+          font-size:11px;font-weight:600;color:var(--amber);
+          display:flex;align-items:center;gap:5px;
+          transition:background .2s,border-color .2s;white-space:nowrap
+        }
+        .seed-btn:hover{background:rgba(245,158,11,0.18);border-color:rgba(245,158,11,0.5)}
+        .seed-btn:disabled{opacity:0.45;cursor:not-allowed}
+
+        /* ── Layout ── */
+        .app{flex:1;display:flex;min-height:0;overflow:hidden}
+
+        /* ── Floor plan ── */
+        .floorplan{flex:1;padding:20px;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1.1fr 1fr;gap:12px;min-width:0;overflow:hidden}
+        .room{background:var(--surface);border:1px solid var(--border);border-radius:12px;display:flex;flex-direction:column;overflow:hidden;position:relative;transition:border-color .3s}
+        .room.wide{grid-column:1/3}
+        .room-alert-danger{border:2px solid var(--red)!important;animation:pulse-border 1.5s infinite}
+        .room-alert-attention{border:2px solid var(--amber)!important;animation:pulse-border 1.5s infinite}
+        .room-alert-info{border:2px solid var(--blue)!important;animation:pulse-border 1.5s infinite}
+        @keyframes pulse-border{0%,100%{opacity:1}50%{opacity:0.45}}
+        .room-header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px 8px;border-bottom:1px solid var(--border);flex-shrink:0}
+        .room-name{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim)}
+        .room-alert-tag{display:none;font-size:10px;font-weight:600;border-radius:20px;padding:2px 8px}
+        .room-alert-danger .room-alert-tag{display:block;color:#fca5a5;background:rgba(239,68,68,.15);border:1px solid #ef4444}
+        .room-alert-attention .room-alert-tag{display:block;color:#fcd34d;background:rgba(245,158,11,.15);border:1px solid #f59e0b}
+        .room-alert-info .room-alert-tag{display:block;color:#93c5fd;background:rgba(59,130,246,.15);border:1px solid #3b82f6}
+
+        /* ── Devices ── */
+        .devices{flex:1;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:14px;padding:14px}
+        .wide .devices{justify-content:space-evenly}
+        .device{display:flex;flex-direction:column;align-items:center;gap:7px;cursor:pointer;user-select:none;border:none;background:none;padding:0}
+        .device-btn{width:52px;height:52px;border-radius:14px;background:var(--muted);border:1px solid transparent;display:flex;align-items:center;justify-content:center;transition:background .25s,border-color .25s,box-shadow .25s;cursor:pointer;font-size:22px;line-height:1}
+        .device-label{font-size:10.5px;font-weight:500;color:var(--text-dim);transition:color .25s;white-space:nowrap}
+        .device-btn span{filter:grayscale(1) opacity(0.55);transition:filter .25s}
+        .device-btn svg{color:#6b7280;transition:color .25s}
+        .device-on .device-btn{background:rgba(245,158,11,0.12);border-color:var(--amber);box-shadow:0 0 12px rgba(245,158,11,0.5)}
+        .device-on .device-btn span{filter:none}
+        .device-on .device-btn svg{color:#f59e0b}
+        .device-on .device-label{color:var(--amber);font-weight:600}
+
+        /* ── Sidebar ── */
+        .sidebar{width:310px;flex-shrink:0;background:var(--bg);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow-y:auto;padding:16px 14px;gap:12px}
+        .sidebar-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:10px;flex-shrink:0}
+        .card-title{font-size:12px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:7px}
+        .pulse-dot{width:8px;height:8px;background:var(--blue);border-radius:50%;animation:pulseDot 1.6s ease-in-out infinite;flex-shrink:0}
+        @keyframes pulseDot{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.5);opacity:.5}}
+        .card-body{font-size:12.5px;color:#9ca3af;font-style:italic;line-height:1.5}
+        .card-body-detail{font-size:11px;color:var(--text-dim);font-style:italic;line-height:1.4;margin-top:-4px}
+        .empty-state{font-size:12px;color:var(--text-dim);font-style:italic}
+        .auto-item{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:6px}
+        .auto-item-name{font-size:12px;font-weight:600;color:var(--text)}
+        .auto-item-desc{font-size:11px;color:var(--text-dim)}
+        .auto-item-btns{display:flex;gap:6px;margin-top:2px}
+        .active-item{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)}
+        .active-item:last-child{border-bottom:none}
+        .active-item-left{display:flex;align-items:center;gap:7px}
+        .active-dot{width:7px;height:7px;background:var(--green);border-radius:50%;flex-shrink:0}
+        .active-name{font-size:12px;color:var(--text)}
+        .btn-green{background:var(--green);color:#fff;border:none;border-radius:20px;font-size:11px;font-weight:600;padding:5px 12px;cursor:pointer;transition:background .2s}
+        .btn-green:hover{background:#059669}
+        .btn-muted{background:var(--muted);color:#9ca3af;border:1px solid var(--border);border-radius:20px;font-size:11px;font-weight:600;padding:5px 12px;cursor:pointer;transition:background .2s}
+        .btn-muted:hover{background:#4b5563}
+        .btn-remove{background:rgba(239,68,68,.12);color:#f87171;border:1px solid #ef4444;border-radius:20px;font-size:10px;font-weight:600;padding:3px 10px;cursor:pointer}
+        .pattern-row{display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border)}
+        .pattern-row:last-child{border-bottom:none}
+        .pattern-left{display:flex;flex-direction:column;gap:2px}
+        .pattern-name{font-size:11.5px;color:var(--text);font-weight:500}
+        .pattern-time{font-size:10px;color:var(--text-dim)}
+        .badge{font-size:10px;font-weight:700;border-radius:20px;padding:3px 9px;color:#fff}
+        .badge-high{background:var(--green)}
+        .badge-medium{background:var(--amber)}
+        .badge-low{background:var(--text-dim)}
+        .yamnet-wrap{padding-top:8px;border-top:1px solid var(--border)}
+
+        /* ── Toast ── */
+        @keyframes toastIn{from{transform:translateX(120px);opacity:0}to{transform:translateX(0);opacity:1}}
+      `}</style>
+
+      {/* ── NAVBAR ─────────────────────────────────────── */}
+      <nav className="navbar">
+        <span className="nav-brand">⚡ Alexa Ambient</span>
+
+        {/* Time slider — simulates time of day for demo */}
+        <div className="nav-slider-wrap">
+          <span className="time-label">{formatTimeDisplay(houseState.time)}</span>
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
+            <input
+              type="range" min={360} max={1380} step={15}
+              value={timeMinutes}
+              onChange={(e) => handleTimeChange(parseInt(e.target.value))}
+              style={{ flex: 1, height: 4, accentColor: "#f59e0b", cursor: "pointer" }}
+            />
+            <div className="time-range-labels"><span>6:00 AM</span><span>11:00 PM</span></div>
+          </div>
+        </div>
+
+        <div className="nav-right">
+          {/* Seed Demo Data — small utility button for presentation resets */}
+          <button
+            className="seed-btn"
+            onClick={handleSeed}
+            disabled={isSeedLoading}
+            title="Seed 5 days of realistic household data into DynamoDB"
+          >
+            {isSeedLoading ? "⏳" : "🌱"} {isSeedLoading ? "Seeding..." : "Seed Demo"}
+          </button>
+
+          {/* Entry Point 3: Alexa Voice Controller */}
+          <AlexaVoiceController
+            houseState={houseState}
+            onDeviceCommand={handleDeviceCommand}
+            onAIResponse={handleVoiceAIResponse}
+          />
+        </div>
+      </nav>
+
+      {/* ── MAIN ───────────────────────────────────────── */}
+      <div className="app">
+
+        {/* ── FLOOR PLAN ─────────────────────────────────── */}
+        <div className="floorplan">
+          {ROOMS.map((room) => (
+            <div
+              key={room.id}
+              className={`room${room.wide ? " wide" : ""} ${getRoomAlertClass(room.id)}`}
+              data-room-id={room.id}
+            >
+              <div className="room-header">
+                <span className="room-name">{room.label}</span>
+                <span className="room-alert-tag">
+                  {houseState.audioEvents
+                    .find((e) => e.roomId === room.id)
+                    ?.label.replace(/_/g, " ") || "Alert"}
+                </span>
+              </div>
+              <div className="devices">
+                {room.devices.map((deviceId) => {
+                  const cfg   = DEVICE_CONFIG[deviceId];
+                  const isOn  = houseState.devices[deviceId];
+                  const isFan = cfg.icon === "fan";
+                  return (
+                    <button
+                      key={deviceId}
+                      className={`device${isFan ? " fan-device" : ""}${isOn ? " device-on" : ""}`}
+                      onClick={() => toggleDevice(deviceId)}
+                      aria-label={cfg.label}
+                      data-device-id={deviceId}
+                    >
+                      <div className="device-btn">
+                        {isFan ? <FanIcon spinning={isOn} /> : <span>{cfg.icon}</span>}
+                      </div>
+                      <span className="device-label">{cfg.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* ── SIDEBAR ─────────────────────────────────────── */}
+        <aside className="sidebar">
+
+          {/* Card 1: AI Reasoning panel */}
+          <div className="sidebar-card">
+            <div className="card-title">
+              <span className="pulse-dot" style={{ opacity: isThinking ? 1 : 0.3 }}></span>
+              🧠 Alexa is Thinking...
+            </div>
+            <p className="card-body">{reasoning.message}</p>
+            {reasoning.detail && (
+              <p className="card-body-detail">💡 {reasoning.detail}</p>
+            )}
+            {/* Automation confirmation buttons (shown after proactive TTS ask) */}
+            {pendingAutomationAsk && (
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <button
+                  className="btn-green"
+                  onClick={() => {
+                    const auto = active.find((a) => a.id === pendingAutomationAsk);
+                    if (auto) {
+                      setReasoning({ message: `✅ ${auto.name} activated!`, detail: "Automation executed." });
+                      if (window.speechSynthesis) {
+                        window.speechSynthesis.cancel();
+                        const utt = new SpeechSynthesisUtterance(`Done! I've activated your ${auto.name}.`);
+                        window.speechSynthesis.speak(utt);
+                      }
+                    }
+                    setPendingAutomationAsk(null);
+                  }}
+                >
+                  Yes, do it
+                </button>
+                <button
+                  className="btn-muted"
+                  onClick={() => {
+                    setPendingAutomationAsk(null);
+                    setReasoning({ message: "Okay, skipping this time.", detail: "" });
+                  }}
+                >
+                  Skip
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Card 2: Suggested Automations */}
+          <div className="sidebar-card">
+            <div className="card-title">⚡ Suggested Automations</div>
+            {suggested.length === 0 ? (
+              <p className="empty-state">Trigger some events to see AI suggestions</p>
+            ) : (
+              suggested.map((a) => (
+                <div key={a.id} className="auto-item">
+                  <div className="auto-item-name">{a.name}</div>
+                  <div className="auto-item-desc">{a.trigger} → {a.action}</div>
+                  <div className="auto-item-desc" style={{ fontStyle: "italic", color: "#6b7280" }}>
+                    💡 {a.reasoning}
+                  </div>
+                  <div className="auto-item-btns">
+                    <button
+                      className="btn-green"
+                      onClick={() => {
+                        setActive((p) => [...p, { id: a.id, name: a.name }]);
+                        setSuggested((p) => p.filter((x) => x.id !== a.id));
+                      }}
+                    >
+                      Automate This
+                    </button>
+                    <button
+                      className="btn-muted"
+                      onClick={() => setSuggested((p) => p.filter((x) => x.id !== a.id))}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          {/* Card 3: Active Automations */}
+          <div className="sidebar-card">
+            <div className="card-title">✅ Active Automations</div>
+            {active.length === 0 ? (
+              <p className="empty-state">No automations active yet</p>
+            ) : (
+              active.map((a) => (
+                <div key={a.id} className="active-item">
+                  <div className="active-item-left">
+                    <span className="active-dot"></span>
+                    <span className="active-name">{a.name}</span>
+                  </div>
+                  <button
+                    className="btn-remove"
+                    onClick={() => setActive((p) => p.filter((x) => x.id !== a.id))}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+
+          {/* Card 4: Household Patterns (from DynamoDB aggregation) */}
+          <div className="sidebar-card">
+            <div className="card-title">📊 Household Patterns</div>
+            {patterns.map((r, i) => (
+              <div key={i} className="pattern-row">
+                <div className="pattern-left">
+                  <span className="pattern-name">{r.event.replace(/_/g, " ")}</span>
+                  <span className="pattern-time">{r.typical_window} · {r.occurrences}x</span>
+                </div>
+                <span className={`badge badge-${r.confidence}`}>{r.confidence}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Card 5: Entry Point 2 — YAMNet Audio Monitor */}
+          <div className="sidebar-card">
+            <div className="card-title">🎙️ Audio Monitor</div>
+            <div className="yamnet-wrap">
+              <YAMNetAudioMonitor onEventDetected={handleAudioEvent} />
+            </div>
+          </div>
+
+        </aside>
       </div>
 
-      <main className="max-w-6xl mx-auto p-4 md:p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
-        
-        {/* Left Column: Context & Simulator */}
-        <div className="lg:col-span-1 space-y-6">
-          
-          {/* Phase 2: Dynamic Context Panel */}
-          <Card className="rounded-md border-0 shadow-sm overflow-hidden">
-            <CardHeader className="bg-gray-50 border-b pb-4">
-              <CardTitle className="text-lg flex items-center gap-2">
-<<<<<<< HEAD
-                <Settings className="w-5 h-5 text-gray-500" />
-                Household Context
-              </CardTitle>
-              <CardDescription>
-                Change these settings to see how AI logic adapts dynamically.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="pt-6 flex flex-col gap-5">
-              <div>
-                <label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 block">Time of Day</label>
-                <select 
-                  className="w-full border border-gray-300 rounded-sm text-sm p-2 bg-white text-black outline-none focus:border-amazon-orange focus:ring-1 focus:ring-amazon-orange transition-all"
-                  value={timeOfDay}
-                  onChange={(e) => setTimeOfDay(e.target.value)}
-                >
-                  <option>2:00 PM (Afternoon)</option>
-                  <option>8:00 AM (Morning Rush)</option>
-                  <option>8:00 PM (Evening/Bedtime)</option>
-                  <option>3:00 AM (Middle of the Night)</option>
-                </select>
-              </div>
-              <div>
-                <label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 block">Home Status</label>
-                <select 
-                  className="w-full border border-gray-300 rounded-sm text-sm p-2 bg-white text-black outline-none focus:border-amazon-orange focus:ring-1 focus:ring-amazon-orange transition-all"
-                  value={homeState}
-                  onChange={(e) => setHomeState(e.target.value)}
-                >
-                  <option value="quiet">Quiet (Normal)</option>
-                  <option value="sleeping">Everyone is sleeping</option>
-                  <option value="away">Empty (Away Mode)</option>
-                  <option value="noisy">Very Noisy / Party</option>
-                </select>
-              </div>
-            </CardContent>
-          </Card>
-
-          {/* Edge AI Simulator */}
-          <Card className="rounded-md border-0 shadow-sm overflow-hidden">
-            <CardHeader className="bg-gray-50 border-b pb-4">
-              <CardTitle className="text-lg flex items-center gap-2">                
-                <div className="relative">
-                  <Mic className={`w-5 h-5 ${isListening ? "text-red-500" : "text-gray-400"}`} />
-                  {isListening && (
-                    <span className="absolute inset-0 rounded-full border-2 border-red-500 animate-ping"></span>
-                  )}
-                </div>
-                Edge AI Simulation
-              </CardTitle>
-              <CardDescription>
-                Trigger events to simulate the real-time acoustic pipeline.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="pt-6 flex flex-col gap-3">
-              <Button 
-                className="bg-amazon-yellow text-black hover:bg-amazon-orange rounded-sm shadow-sm font-medium justify-start transition-colors"
-                onClick={() => triggerEvent("baby_crying", "Baby Crying Detected")}
-              >
-                <Activity className="w-4 h-4 mr-2" />
-                Trigger: Baby Crying
-              </Button>
-              <Button 
-                className="bg-white border border-gray-300 text-black hover:bg-gray-50 rounded-sm shadow-sm font-medium justify-start transition-colors"
-                onClick={() => triggerEvent("pressure_cooker_whistle", "Cooker Whistle (x3)")}
-              >
-                <ShieldAlert className="w-4 h-4 mr-2 text-red-500" />
-                Trigger: Cooker Whistle
-              </Button>
-              <Button 
-                className="bg-white border border-gray-300 text-black hover:bg-gray-50 rounded-sm shadow-sm font-medium justify-start transition-colors"
-                onClick={() => triggerEvent("water_motor_on", "Water Motor On")}
-              >
-                <Bell className="w-4 h-4 mr-2 text-blue-500" />
-                Trigger: Water Motor
-              </Button>
-              <Button 
-                className="bg-white border border-gray-300 text-black hover:bg-purple-50 rounded-sm shadow-sm font-medium justify-start transition-colors"
-                onClick={() => triggerEvent("repetitive_kya_kya", "Elderly: 'Kya? Kya?' (TV Vol increasing)")}
-              >
-                <Heart className="w-4 h-4 mr-2 text-purple-500" />
-                Trigger: Hearing Struggle
-              </Button>
-              <Button 
-                className="bg-white border border-gray-300 text-black hover:bg-blue-50 rounded-sm shadow-sm font-medium justify-start transition-colors"
-                onClick={() => triggerEvent("rapid_typing_sighs", "Partner: High Stress (Rapid Typing & Sighs)")}
-              >
-                <Activity className="w-4 h-4 mr-2 text-blue-500" />
-                Trigger: High Stress
-              </Button>
-
-              <TeachableAudioMonitor onEventDetected={triggerEvent} />
-            </CardContent>
-          </Card>
-
-          {/* Phase 3: Connected Family Panel */}
-          <Card className="rounded-md border-0 shadow-sm overflow-hidden">
-            <CardHeader className="bg-gray-50 border-b pb-3">
-              <CardTitle className="text-sm flex items-center gap-2 font-bold text-gray-700">
-                <Users className="w-4 h-4 text-purple-500" />
-                Family Care Circle
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="pt-4 flex flex-col gap-3">
-              <div className="flex items-center justify-between text-sm">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-700 font-bold text-xs">S</div>
-                  <div>
-                    <p className="font-medium">Son (Rahul)</p>
-                    <p className="text-[10px] text-gray-500">Seattle • Notified 2d ago</p>
-                  </div>
-                </div>
-                <Button variant="ghost" size="sm" className="h-6 text-xs text-amazon-link hover:underline">Drop In</Button>
-              </div>
-              <div className="flex items-center justify-between text-sm">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 rounded-full bg-pink-100 flex items-center justify-center text-pink-700 font-bold text-xs">D</div>
-                  <div>
-                    <p className="font-medium">Daughter (Priya)</p>
-                    <p className="text-[10px] text-gray-500">New York • Notified 5h ago</p>
-                  </div>
-                </div>
-                <Button variant="ghost" size="sm" className="h-6 text-xs text-amazon-link hover:underline">Drop In</Button>
-              </div>
-              <Button variant="outline" className="w-full h-8 text-xs mt-2 border-dashed border-gray-300 text-gray-500 hover:bg-gray-50">
-                + Add Family Member
-              </Button>
-            </CardContent>
-          </Card>
+      {/* ── Toast notification ─────────────────────────── */}
+      {toast && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 24,
+            right: 24,
+            background: toast.type === "success" ? "var(--green)" : "var(--red)",
+            color: "#fff",
+            padding: "12px 20px",
+            borderRadius: 10,
+            fontSize: 13,
+            fontWeight: 600,
+            zIndex: 9999,
+            boxShadow: "0 4px 28px rgba(0,0,0,0.55)",
+            animation: "toastIn 0.3s ease",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          {toast.type === "success" ? "✅" : "❌"} {toast.message}
         </div>
-
-        {/* Right Column: Dashboard & Logs */}
-        <div className="lg:col-span-2 space-y-6">
-          <div className="grid grid-cols-2 gap-4">
-            <Card className="rounded-md border-0 shadow-sm bg-white hover:shadow-md transition-shadow">
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm text-gray-500 font-normal">Active Automations</CardTitle>
-                <p className="text-2xl font-bold">3</p>
-              </CardHeader>
-            </Card>
-            <Card className="rounded-md border-0 shadow-sm bg-white hover:shadow-md transition-shadow">
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm text-gray-500 font-normal">Safety Status</CardTitle>
-                <p className="text-2xl font-bold text-green-600 flex items-center gap-2">
-                  <span className="w-3 h-3 rounded-full bg-green-500 animate-pulse"></span>
-                  Secure
-                </p>
-              </CardHeader>
-            </Card>
-          </div>
-
-          <Card className="rounded-md border-0 shadow-sm min-h-[400px]">
-            <CardHeader className="border-b bg-gray-50 rounded-t-md">
-              <CardTitle>Household Event Timeline</CardTitle>
-              <CardDescription>Real-time log of events and AI proactive decisions</CardDescription>
-            </CardHeader>
-            <CardContent className="p-0">
-              {logs.filter(log => {
-                  const t = (log.target || "").toLowerCase();
-                  const s = (log.source || "").toLowerCase();
-                  const a = activeProfile.toLowerCase();
-                  
-                  // Empathy events: ONLY the target can see it.
-                  if (log.type === "family_connect") return t === a;
-                  
-                  // Normal events: ONLY the source (where it was triggered) can see it.
-                  return s === a || t === "everyone";
-              }).length === 0 ? (
-                <div className="p-12 text-center text-gray-500 flex flex-col items-center">
-                  <Activity className="w-12 h-12 text-gray-300 mb-4" />
-                  <p>No events recorded yet.</p>
-                  <p className="text-sm mt-1">Press a trigger button to simulate audio input.</p>
-                </div>
-              ) : (
-                <ul className="divide-y max-h-[500px] overflow-y-auto">
-                  {logs.filter(log => {
-                    const t = (log.target || "").toLowerCase();
-                    const s = (log.source || "").toLowerCase();
-                    const a = activeProfile.toLowerCase();
-                    if (log.type === "family_connect") return t === a;
-                    return s === a || t === "everyone";
-                  }).map((log) => (
-                    <li key={log.id} className="p-4 flex flex-col gap-1 hover:bg-gray-50 transition-colors group">
-                      <div className="flex justify-between items-start">
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs text-gray-400 font-medium">{log.time}</span>
-                        </div>
-                        <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${
-                          log.type === "trigger" ? "bg-gray-100 text-gray-600" :
-                          log.type === "alert" ? "bg-red-100 text-red-700" :
-                          log.type === "commerce" ? "bg-blue-100 text-blue-700" :
-                          log.type === "family_connect" ? "bg-purple-100 text-purple-700" :
-                          "bg-green-100 text-green-700"
-                        }`}>
-                          {log.type.toUpperCase()}
-                        </span>
-                      </div>
-                      <span className={`font-medium text-sm ${log.type === 'alert' ? 'text-red-600' : log.type === 'family_connect' ? 'text-purple-600' : log.type === 'commerce' ? 'text-amazon-orange' : log.type === 'trigger' ? 'text-gray-500 text-xs font-bold uppercase tracking-wider' : 'text-gray-900'}`}>
-                        {log.message}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </CardContent>
-          </Card>
-        </div>
-      </main>
-
-      {/* Phase 2: Sliding Amazon Cart Panel */}
-      {isCartOpen && (
-        <>
-          {/* Overlay */}
-          <div 
-            className="fixed inset-0 bg-black/50 z-40 transition-opacity"
-            onClick={() => setIsCartOpen(false)}
-          />
-          
-          {/* Side Cart Drawer */}
-          <div className="fixed right-0 top-0 bottom-0 w-full sm:w-96 bg-white shadow-2xl z-50 flex flex-col animate-in slide-in-from-right duration-300">
-            <div className="flex justify-between items-center p-4 border-b bg-gray-50">
-              <h2 className="text-xl font-bold text-amazon-black flex items-center gap-2">
-                <ShoppingCart className="w-6 h-6" /> Subtotal
-              </h2>
-              <button 
-                onClick={() => setIsCartOpen(false)} 
-                className="p-2 hover:bg-gray-200 rounded-full transition-colors"
-              >
-                <X className="w-5 h-5 text-gray-500" />
-              </button>
-            </div>
-            
-            <div className="flex-1 overflow-y-auto p-4 bg-white">
-              {cartItems.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-full text-center text-gray-500 space-y-4">
-                  <ShoppingCart className="w-16 h-16 text-gray-200" />
-                  <p>Your Amazon Cart is empty.</p>
-                </div>
-              ) : (
-                <div className="flex flex-col gap-4">
-                  {cartItems.map((item, idx) => (
-                    <div key={idx} className="flex gap-4 border-b border-gray-100 pb-4">
-                      <div className="w-20 h-20 bg-gray-50 border rounded-sm flex items-center justify-center text-3xl shrink-0 shadow-sm">
-                        📦
-                      </div>
-                      <div className="flex-1 flex flex-col justify-center">
-                        <p className="font-medium text-sm text-amazon-link hover:underline cursor-pointer leading-tight mb-1">
-                          {item.name}
-                        </p>
-                        <p className="text-amazon-textprimary font-bold text-lg">{item.price}</p>
-                        <p className="text-xs text-green-700 font-medium">In Stock</p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-            
-            {/* Cart Footer */}
-            {cartItems.length > 0 && (
-              <div className="p-4 border-t bg-gray-50 shadow-[0_-4px_6px_-1px_rgb(0,0,0,0.05)]">
-                <Button className="w-full bg-amazon-yellow hover:bg-amazon-orange text-black font-medium h-12 text-sm shadow-sm">
-                  Proceed to Checkout ({cartItems.length} items)
-                </Button>
-              </div>
-            )}
-          </div>
-        </>
       )}
-
-      <Toaster position="top-center" richColors />
-    </div>
+    </>
   );
 }
