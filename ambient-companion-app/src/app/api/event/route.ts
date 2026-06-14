@@ -9,21 +9,30 @@ const DEVICE_MANIFEST = `AVAILABLE DEVICES IN THIS HOME:
 - Study Room: ceiling_light, desk_lamp, ceiling_fan
 - Utility/Balcony: water_motor, washing_machine`;
 
-const SYSTEM_PROMPT = `You are an autonomous ambient intelligence agent for an Indian household.
-You observe the full state of the home — which devices are on, what time it is, recent audio events — and decide the single most helpful proactive action.
+const SYSTEM_PROMPT = `You are an ambient home intelligence agent for an Indian household. You are silent unless something meaningful happens.
 
-Your job is NOT to respond to commands. Your job is to ANTICIPATE needs.
+You have two modes:
+1. AMBIENT MODE (no voiceCommand): Monitor silently. Only speak up when there is a genuine pattern, safety issue, or family care need. If nothing meaningful is happening, return action_type "info" with message "Monitoring." — nothing more.
+2. VOICE COMMAND MODE (voiceCommand present): Execute the spoken request directly.
 
 ${DEVICE_MANIFEST}
 
-ABSOLUTE SAFETY RULES — you cannot override these:
-- Never suggest automating any heating appliance (geyser, water heater, room heater, induction, microwave, iron, boiler)
-- Never suggest automating door locks, security systems, or gas valves
-- When uncertain, use action_type "info" — doing nothing is safer than doing something wrong
-- Never expose one family member's private activity to another without clear safety justification
+CRITICAL RULES FOR AMBIENT MODE:
+- A light turning on or off alone is NOT meaningful. Return action_type "info", message "Monitoring." 
+- A fan or TV being toggled alone is NOT meaningful. Return action_type "info", message "Monitoring."
+- Only use routine_suggestion if you see a GENUINE REPEATED PATTERN in the household history (3+ occurrences at same time)
+- Only use alert for actual safety/urgency (smoke, baby crying, glass breaking, pressure cooker)
+- Only use family_connect if someone appears to be struggling or lonely
+- Only use anomaly if something clearly breaks an established pattern
+- NEVER narrate device state. NEVER say things like "the lights are on" or "it's morning time"
+- When uncertain, return action_type "info", message "Monitoring." — silence is always better than noise
+
+SAFETY RULES:
+- Never automate heating appliances (geyser, induction, microwave, iron, boiler)
+- Never automate door locks, security systems, or gas valves
 
 INDIAN HOUSEHOLD CONTEXT:
-You understand: morning puja (bell sounds), pressure cooker whistles, water motor cycles, study hours, evening chai, power cuts, doorbell, baby care, elderly needs.`;
+Morning puja bells, pressure cooker whistles, water motor cycles, study hours, evening chai, power cuts, doorbell, baby care, elderly needs.`;
 
 function buildHouseStateDescription(houseState: {
   devices: Record<string, boolean>;
@@ -69,27 +78,12 @@ export async function POST(request: Request) {
       process.env.AWS_ACCESS_KEY_ID !== "dummy"
     );
 
-    // 1. Short-term memory
+    // 1. Short-term memory & 2. Routine profile (Merged Scan)
     let shortTermMemory: { time: string; message: string }[] = [
       { time: "recently", message: "morning_puja_bell detected" },
       { time: "recently", message: "water_motor turned on" },
       { time: "earlier",  message: "bedroom_light turned on" },
     ];
-
-    if (isAwsConfigured) {
-      try {
-        const data = await dynamoDb.send(new ScanCommand({ TableName: "HouseholdLogs" }));
-        const items = (data.Items || [])
-          .filter((i) => i.type === "trigger" || i.type === "state_snapshot")
-          .sort((a, b) => b.timestamp - a.timestamp)
-          .slice(0, 8);
-        if (items.length > 0) {
-          shortTermMemory = items.map((i) => ({ time: i.time || "recently", message: i.message }));
-        }
-      } catch (e) { console.error("Short-term memory fetch failed:", e); }
-    }
-
-    // 2. Routine profile
     let routineProfile: { event: string; occurrences: number; typical_window: string; confidence: string }[] = [
       { event: "water_motor_on",          occurrences: 5, typical_window: "Morning",   confidence: "high" },
       { event: "morning_puja_bell",        occurrences: 4, typical_window: "Morning",   confidence: "high" },
@@ -100,7 +94,19 @@ export async function POST(request: Request) {
     if (isAwsConfigured) {
       try {
         const data = await dynamoDb.send(new ScanCommand({ TableName: "HouseholdLogs" }));
-        const triggers = (data.Items || []).filter((i) => i.type === "trigger");
+        const allItems = data.Items || [];
+        
+        // Short-term memory
+        const recentItems = allItems
+          .filter((i) => i.type === "trigger" || i.type === "state_snapshot")
+          .sort((a, b) => b.timestamp - a.timestamp)
+          .slice(0, 8);
+        if (recentItems.length > 0) {
+          shortTermMemory = recentItems.map((i) => ({ time: i.time || "recently", message: i.message }));
+        }
+
+        // Routine profile
+        const triggers = allItems.filter((i) => i.type === "trigger");
         if (triggers.length > 0) {
           const grouped: Record<string, { occurrences: number; windows: Record<string, number> }> = {};
           triggers.forEach((item) => {
@@ -119,7 +125,7 @@ export async function POST(request: Request) {
             return { event, occurrences: g.occurrences, typical_window: maxWindow, confidence };
           });
         }
-      } catch (e) { console.error("Routine profile fetch failed:", e); }
+      } catch (e) { console.error("DynamoDB scan failed:", e); }
     }
 
     // 3. Build prompt
@@ -131,7 +137,7 @@ export async function POST(request: Request) {
 
     // Inject voice command section when present (Entry Point 3)
     const voiceSection = voiceCommand
-      ? `\nVOICE COMMAND FROM USER: "${voiceCommand}"\nThis is a direct spoken command. Return action_type "voice_command_execute" and populate device_command.\nAvailable deviceId values: bedroom_light, night_light, geyser, ac, bedroom_fan, kitchen_light, induction, microwave, tv, living_fan, living_light, study_ceiling_light, study_lamp, study_fan, water_motor, washing_machine\n`
+      ? `\nVOICE COMMAND FROM USER: "${voiceCommand}"\n\nYou are in VOICE COMMAND MODE. Respond to this command directly.\n- If it asks about time, tell them the current time (${effectiveHouseState.time}) in a friendly way.\n- If it asks to turn on/off a device, set action_type to "voice_command_execute" and populate device_command.\n- If it is a question (weather, time, general info), just answer helpfully in the message field, set action_type to "voice_command_execute", device_command to null.\n- Available deviceIds: bedroom_light, night_light, geyser, ac, bedroom_fan, kitchen_light, induction, microwave, tv, living_fan, living_light, study_ceiling_light, study_lamp, study_fan, water_motor, washing_machine\n`
       : "";
 
     const USER_PROMPT = `${houseDesc}
@@ -144,19 +150,19 @@ ${routineDesc}
 
 Profile context: ${sourceProfile}
 ${voiceSection}
-Decide the single most helpful proactive action. Respond with ONLY raw JSON:
+Respond with ONLY raw JSON (no markdown):
 {
   "action_type": "routine_suggestion" | "alert" | "family_connect" | "info" | "anomaly" | "voice_command_execute",
   "target_profile": "parents" | "children" | "partner" | "everyone",
-  "message": "1-2 sentence warm helpful message",
+  "message": "1-2 sentence response — warm and conversational for voice commands, helpful for ambient",
   "reasoning": "1 sentence: why you chose this action",
   "suggested_automation": { "name": "string", "trigger": "string", "action": "string" } | null,
   "device_command": { "deviceId": "string", "state": true, "delay_minutes": 0 } | null
 }
 
-action_type: routine_suggestion=pattern worth automating, alert=safety/urgent, family_connect=family check needed, anomaly=unusual activity, info=routine log, voice_command_execute=direct spoken command from user
-target_profile for family_connect: use the OTHER profile (if ${sourceProfile} is parents, target is children)
-For voice_command_execute: set device_command.deviceId to exact device, state=true for on/false for off, delay_minutes=0 for immediate. Set device_command to null for non-device commands.`;
+For voice_command_execute with a device: set device_command to the device object.
+For voice_command_execute without a device (questions, general info): set device_command to null.
+For ambient mode: set device_command to null.`;
 
     // 4. Call Groq
     let aiDecision: {
@@ -186,8 +192,12 @@ For voice_command_execute: set device_command.deviceId to exact device, state=tr
           let content = groqData?.choices?.[0]?.message?.content?.trim() || "";
           content = content.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
           aiDecision = JSON.parse(content);
+        } else {
+          console.error("Groq error:", res.status);
         }
-      } catch (e) { console.error("Groq failed:", e); }
+      } catch (e) {
+        console.error("Groq failed:", e);
+      }
     }
 
     // 5. Fallback

@@ -81,11 +81,43 @@ export function AlexaVoiceController({
   const speak = useCallback((text: string) => {
     if (typeof window === "undefined" || !window.speechSynthesis) return;
     window.speechSynthesis.cancel();
-    const utt = new SpeechSynthesisUtterance(text);
-    utt.rate = 0.95;
-    utt.pitch = 1.05;
-    utt.volume = 1.0;
-    window.speechSynthesis.speak(utt);
+
+    const PREFERRED = [
+      "Google UK English Female",
+      "Microsoft Aria Online (Natural) - English (United States)",
+      "Microsoft Jenny Online (Natural) - English (United States)",
+      "Microsoft Zira - English (United States)",
+      "Google US English",
+    ];
+
+    const pickVoice = () => {
+      const voices = window.speechSynthesis.getVoices();
+      return PREFERRED.reduce<SpeechSynthesisVoice | null>((found, name) =>
+        found ?? voices.find((v) => v.name === name) ?? null, null)
+        ?? voices.find((v) => v.lang.startsWith("en") && v.name.toLowerCase().includes("female"))
+        ?? voices.find((v) => v.lang.startsWith("en"))
+        ?? null;
+    };
+
+    const utter = (voice: SpeechSynthesisVoice | null) => {
+      const utt = new SpeechSynthesisUtterance(text);
+      if (voice) utt.voice = voice;
+      utt.rate = 0.92;
+      utt.pitch = 1.1;
+      utt.volume = 1.0;
+      window.speechSynthesis.speak(utt);
+    };
+
+    const voice = pickVoice();
+    if (voice) {
+      utter(voice);
+    } else {
+      const onVoices = () => {
+        window.speechSynthesis.removeEventListener("voiceschanged", onVoices);
+        utter(pickVoice());
+      };
+      window.speechSynthesis.addEventListener("voiceschanged", onVoices);
+    }
   }, []);
 
   // ── Core: POST voice command → /api/event ──────────────
@@ -103,7 +135,7 @@ export function AlexaVoiceController({
         });
         const data = await res.json();
         if (data.success) {
-          const { message, reasoning, action_type, device_command } = data.data;
+          const { message, reasoning, action_type, device_command, device_commands } = data.data;
 
           // 1. Speak the AI's response via TTS
           speak(message);
@@ -112,13 +144,16 @@ export function AlexaVoiceController({
           onAIResponse?.(message, reasoning || "");
 
           // 3. If it's a device command, execute it (with optional delay)
-          if (action_type === "voice_command_execute" && device_command?.deviceId) {
-            const delayMs = (device_command.delay_minutes || 0) * 60000;
-            onDeviceCommand(
-              device_command.deviceId as DeviceId,
-              !!device_command.state,
-              delayMs
-            );
+          if (action_type === "voice_command_execute") {
+            const cmds = device_commands || [];
+            if (device_command) cmds.push(device_command); // backward compatibility
+            
+            cmds.forEach((cmd: any) => {
+              if (cmd.deviceId) {
+                const delayMs = (cmd.delay_minutes || 0) * 60000;
+                onDeviceCommand(cmd.deviceId as DeviceId, !!cmd.state, delayMs);
+              }
+            });
           }
         }
       } catch {
