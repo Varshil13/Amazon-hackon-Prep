@@ -28,7 +28,7 @@ interface AudioEvent { roomId: RoomId; type: AlertType; label: string; }
 interface HouseState { devices: Record<DeviceId, boolean>; time: string; audioEvents: AudioEvent[]; }
 
 interface SuggestedAutomation { id: string; name: string; trigger: string; action: string; reasoning: string; }
-interface ActiveAutomation { id: string; name: string; }
+interface ActiveAutomation { id: string; name: string; trigger: string; action: string; reasoning: string; }
 interface RoutinePattern { event: string; occurrences: number; typical_window: string; confidence: string; }
 
 // ─── Static Config ────────────────────────────────────────
@@ -121,6 +121,18 @@ export default function Home() {
       .then((r) => r.json())
       .then((d) => { if (d.success && d.routines?.length) setPatterns(d.routines); })
       .catch(() => {});
+  }, []);
+
+  // Load persisted active automations from DynamoDB on mount
+  useEffect(() => {
+    fetch("/api/automations")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.success && d.automations?.length) {
+          setActive(d.automations);
+        }
+      })
+      .catch(() => {}); // silent failure on load
   }, []);
 
   // ── Automation proactive checker (runs every 60s) ──────
@@ -225,6 +237,42 @@ export default function Home() {
     setReasoning({ message, detail });
   }, []);
 
+  // ── Optimistic remove with rollback (Req 7.1, 7.2, 7.3) ──
+  const handleRemoveAutomation = useCallback(async (automationId: string) => {
+    let removedItem: ActiveAutomation | undefined;
+    let removedIndex = -1;
+
+    setActive((prev) => {
+      removedIndex = prev.findIndex((x) => x.id === automationId);
+      removedItem = prev[removedIndex];
+      return prev.filter((x) => x.id !== automationId);
+    });
+
+    try {
+      const res = await fetch(`/api/automations?id=${encodeURIComponent(automationId)}`, {
+        method: "DELETE",
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("Automation removed.");
+      } else {
+        throw new Error(data.error || "Server error");
+      }
+    } catch {
+      // Rollback — restore at original position
+      if (removedItem !== undefined) {
+        const item = removedItem;
+        const idx = removedIndex;
+        setActive((prev) => {
+          const next = [...prev];
+          next.splice(idx, 0, item);
+          return next;
+        });
+      }
+      showToast("Failed to remove automation. Please try again.", "error");
+    }
+  }, [showToast]);
+
   // ── Seed demo data (for presentation resets) ───────────
   const handleSeed = useCallback(async () => {
     setIsSeedLoading(true);
@@ -259,6 +307,40 @@ export default function Home() {
       return next;
     });
   }, [sendStateToAI]);
+
+  // ── Automate This — optimistic add with POST rollback ─
+  const handleAutomateThis = useCallback(async (automation: SuggestedAutomation) => {
+    const newActive: ActiveAutomation = {
+      id: automation.id,
+      name: automation.name,
+      trigger: automation.trigger,
+      action: automation.action,
+      reasoning: automation.reasoning,
+    };
+
+    // Optimistic update
+    setActive((prev) => [...prev, newActive]);
+    setSuggested((prev) => prev.filter((x) => x.id !== automation.id));
+
+    try {
+      const res = await fetch("/api/automations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newActive),
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("Automation saved!");
+      } else {
+        throw new Error(data.error || "Server error");
+      }
+    } catch {
+      // Rollback
+      setActive((prev) => prev.filter((x) => x.id !== automation.id));
+      setSuggested((prev) => [automation, ...prev]);
+      showToast("Failed to save automation. Please try again.", "error");
+    }
+  }, [showToast]);
 
   const formatTimeDisplay = (time: string) => {
     const [hStr, mStr] = time.split(":");
@@ -564,10 +646,7 @@ export default function Home() {
                   <div className="auto-item-btns">
                     <button
                       className="btn-green"
-                      onClick={() => {
-                        setActive((p) => [...p, { id: a.id, name: a.name }]);
-                        setSuggested((p) => p.filter((x) => x.id !== a.id));
-                      }}
+                      onClick={() => handleAutomateThis(a)}
                     >
                       Automate This
                     </button>
@@ -597,7 +676,7 @@ export default function Home() {
                   </div>
                   <button
                     className="btn-remove"
-                    onClick={() => setActive((p) => p.filter((x) => x.id !== a.id))}
+                    onClick={() => handleRemoveAutomation(a.id)}
                   >
                     Remove
                   </button>
