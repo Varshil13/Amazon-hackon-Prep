@@ -27,8 +27,9 @@ type AlertType = "danger" | "attention" | "info";
 interface AudioEvent { roomId: RoomId; type: AlertType; label: string; }
 interface HouseState { devices: Record<DeviceId, boolean>; time: string; audioEvents: AudioEvent[]; }
 
+// Full 5-field shape — persisted to DynamoDB
 interface SuggestedAutomation { id: string; name: string; trigger: string; action: string; reasoning: string; }
-interface ActiveAutomation { id: string; name: string; trigger: string; action: string; reasoning: string; }
+interface ActiveAutomation    { id: string; name: string; trigger: string; action: string; reasoning: string; }
 interface RoutinePattern { event: string; occurrences: number; typical_window: string; confidence: string; }
 
 // ─── Static Config ────────────────────────────────────────
@@ -83,13 +84,48 @@ function FanIcon({ spinning }: { spinning: boolean }) {
 }
 
 // ─── Automation helpers ───────────────────────────────────
-function getAutomationTimeLabel(name: string): string {
-  const n = name.toLowerCase();
-  if (n.includes("morning"))   return "6:00 AM";
-  if (n.includes("afternoon")) return "12:00 PM";
-  if (n.includes("evening"))   return "5:00 PM";
-  if (n.includes("night"))     return "8:00 PM";
+// Derive trigger start minute from automation name OR trigger field keywords
+function getAutomationStartMinutes(automation: { name: string; trigger: string }): number {
+  const text = (automation.name + " " + automation.trigger).toLowerCase();
+  if (text.includes("morning") || text.match(/\b(6|7|8)\s*am\b/))   return 360;
+  if (text.includes("afternoon") || text.match(/\b(12|1|2)\s*pm\b/)) return 720;
+  if (text.includes("evening") || text.match(/\b(5|6|7)\s*pm\b/))   return 1020;
+  if (text.includes("night") || text.match(/\b(8|9|10)\s*pm\b/))    return 1200;
+  return -1;
+}
+
+// Derive display time label from automation name + trigger
+function getAutomationTimeLabel(automation: { name: string; trigger?: string }): string {
+  const start = getAutomationStartMinutes({ name: automation.name, trigger: automation.trigger ?? "" });
+  if (start === 360)  return "6:00 AM";
+  if (start === 720)  return "12:00 PM";
+  if (start === 1020) return "5:00 PM";
+  if (start === 1200) return "8:00 PM";
   return "";
+}
+
+// Parse automation.action text → device + desired state
+// Handles: "turn on", "switch on", "enable", "activate", "start", "run", "turn off", "switch off", "disable", "stop", "deactivate"
+function parseActionToDevice(
+  action: string,
+  deviceConfig: Record<string, { label: string }>
+): { deviceId: string; state: boolean } | null {
+  const lower = action.toLowerCase();
+  const turnOn  = lower.includes("turn on")    || lower.includes("switch on")   ||
+                  lower.includes("enable")     || lower.includes("activate")    ||
+                  lower.includes("start")      || lower.includes("run");
+  const turnOff = lower.includes("turn off")   || lower.includes("switch off")  ||
+                  lower.includes("disable")    || lower.includes("deactivate")  ||
+                  lower.includes("stop");
+  if (!turnOn && !turnOff) return null;
+  for (const [id, cfg] of Object.entries(deviceConfig)) {
+    const idSlug = id.replace(/_/g, " ");
+    const label  = cfg.label.toLowerCase();
+    if (lower.includes(idSlug) || lower.includes(id) || lower.includes(label)) {
+      return { deviceId: id, state: turnOn };
+    }
+  }
+  return null;
 }
 
 // ─── Main Page ────────────────────────────────────────────
@@ -104,28 +140,92 @@ export default function Home() {
   const [suggested, setSuggested]     = useState<SuggestedAutomation[]>([]);
   const [active, setActive]           = useState<ActiveAutomation[]>([]);
   const [patterns, setPatterns]       = useState<RoutinePattern[]>([
-    { event: "water_motor",           occurrences: 5, typical_window: "Morning",   confidence: "high" },
-    { event: "morning_puja_bell",     occurrences: 4, typical_window: "Morning",   confidence: "high" },
+    { event: "water_motor",             occurrences: 5, typical_window: "Morning",   confidence: "high" },
+    { event: "morning_puja_bell",       occurrences: 4, typical_window: "Morning",   confidence: "high" },
     { event: "pressure_cooker_whistle", occurrences: 3, typical_window: "Afternoon", confidence: "medium" },
-    { event: "study_hour_silence",    occurrences: 3, typical_window: "Evening",   confidence: "medium" },
+    { event: "study_hour_silence",      occurrences: 3, typical_window: "Evening",   confidence: "medium" },
   ]);
   const [pendingAutomationAsk, setPendingAutomationAsk] = useState<string | null>(null);
-  const [toast, setToast]             = useState<{ message: string; type: "success" | "error" } | null>(null);
+  const [toast, setToast]             = useState<{ message: string; type: "success" | "error" | "info" } | null>(null);
   const [isSeedLoading, setIsSeedLoading] = useState(false);
+  // Scheduled voice commands — fired when time slider reaches targetMinutes
+  const [pendingCommands, setPendingCommands] = useState<{ deviceId: DeviceId; state: boolean; targetMinutes: number }[]>([]);
+  // Tracks the slider-minute at which each device was turned ON — used for anomaly detection
+  const [deviceOnTimes, setDeviceOnTimes] = useState<Partial<Record<DeviceId, number>>>({});
 
-  const debounceRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const latestStateRef = useRef(houseState);
-  latestStateRef.current = houseState;
-  const activeRef      = useRef(active);
+  const debounceRef          = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestStateRef       = useRef(houseState);
+  latestStateRef.current     = houseState;
+  const activeRef            = useRef(active);
   useEffect(() => { activeRef.current = active; }, [active]);
+  const pendingCommandsRef   = useRef(pendingCommands);
+  useEffect(() => { pendingCommandsRef.current = pendingCommands; }, [pendingCommands]);
+  // Cooldown refs — prevent re-firing same automation / greeting on every slider tick
+  const lastAnnouncedAutoRef = useRef<string | null>(null);
+  const lastGreetedPeriodRef = useRef<string | null>(null);
 
   // ── Toast helper ───────────────────────────────────────
-  const showToast = useCallback((message: string, type: "success" | "error" = "success") => {
+  const showToast = useCallback((message: string, type: "success" | "error" | "info" = "success") => {
     setToast({ message, type });
     setTimeout(() => setToast(null), 3500);
   }, []);
 
-  // Load patterns from DynamoDB on mount
+  // ── Global TTS — Alexa speaks everything ───────────────
+  const speak = useCallback((text: string) => {
+    if (typeof window === "undefined" || !window.speechSynthesis) return;
+    // Strip emojis/non-speakable chars, keep letters/numbers/punctuation
+    const clean = text.replace(/[^\p{L}\p{N}\p{P}\p{Z}]/gu, " ").replace(/\s+/g, " ").trim();
+    if (!clean) return;
+
+    const PREFERRED = [
+      "Google UK English Female",
+      "Microsoft Aria Online (Natural) - English (United States)",
+      "Microsoft Jenny Online (Natural) - English (United States)",
+      "Microsoft Zira - English (United States)",
+      "Google US English",
+    ];
+
+    const pickVoice = () => {
+      const voices = window.speechSynthesis.getVoices();
+      return PREFERRED.reduce<SpeechSynthesisVoice | null>((found, name) =>
+        found ?? voices.find((v) => v.name === name) ?? null, null)
+        ?? voices.find((v) => v.lang.startsWith("en") && v.name.toLowerCase().includes("female"))
+        ?? voices.find((v) => v.lang.startsWith("en"))
+        ?? null;
+    };
+
+    const utter = (voice: SpeechSynthesisVoice | null) => {
+      const utt = new SpeechSynthesisUtterance(clean);
+      if (voice) utt.voice = voice;
+      utt.rate = 0.92;
+      utt.pitch = 1.1;
+      utt.volume = 1.0;
+      window.speechSynthesis.speak(utt);
+    };
+
+    // Cancel then yield a tick — Chrome drops utterances queued synchronously after cancel()
+    window.speechSynthesis.cancel();
+    setTimeout(() => {
+      const voice = pickVoice();
+      if (voice) {
+        utter(voice);
+      } else {
+        const onVoices = () => {
+          window.speechSynthesis.removeEventListener("voiceschanged", onVoices);
+          utter(pickVoice());
+        };
+        window.speechSynthesis.addEventListener("voiceschanged", onVoices);
+      }
+    }, 50);
+  }, []);
+
+  // Wrapper — sets reasoning panel AND speaks it
+  const setReasoningAndSpeak = useCallback((r: { message: string; detail: string }) => {
+    setReasoning(r);
+    speak(r.message);
+  }, [speak]);
+
+  // ── Mount fetches ──────────────────────────────────────
   useEffect(() => {
     fetch("/api/routines")
       .then((r) => r.json())
@@ -133,76 +233,110 @@ export default function Home() {
       .catch(() => {});
   }, []);
 
-  // Load persisted active automations from DynamoDB on mount
   useEffect(() => {
     fetch("/api/automations")
       .then((r) => r.json())
-      .then((d) => {
-        if (d.success && d.automations?.length) {
-          setActive(d.automations);
-        }
-      })
+      .then((d) => { if (d.success && d.automations?.length) setActive(d.automations); })
       .catch(() => {}); // silent failure on load
   }, []);
 
-  // ── Automation proactive checker (runs every 60s) ──────
-  // Checks accepted automations against current time slider.
-  // Speaks TTS prompt and shows confirmation buttons.
+  // ── Automation proactive checker ──────────────────────
+  // Called from interval (every 60s) AND from handleTimeChange (immediate on slider move).
+  // Auto-executes the device action + speaks what it did.
+  const checkAutomations = useCallback((currentMinutes: number) => {
+    if (activeRef.current.length === 0) return;
+
+    // Reset cooldown for automations whose window has passed — allows re-fire next day
+    activeRef.current.forEach((automation) => {
+      if (lastAnnouncedAutoRef.current !== automation.id) return;
+      const start = getAutomationStartMinutes(automation);
+      if (start === -1) return;
+      // Window ended — reset so it can fire again
+      if (currentMinutes > start + 45) {
+        lastAnnouncedAutoRef.current = null;
+      }
+    });
+
+    const matched = activeRef.current.find((automation) => {
+      const start = getAutomationStartMinutes(automation);
+      if (start !== -1) {
+        return currentMinutes >= start - 15 && currentMinutes <= start + 45;
+      }
+      // Fallback: if no time keyword, try matching trigger text against current time window
+      const window =
+        currentMinutes < 480  ? "morning" :
+        currentMinutes < 720  ? "morning" :
+        currentMinutes < 900  ? "afternoon" :
+        currentMinutes < 1020 ? "afternoon" :
+        currentMinutes < 1200 ? "evening" : "night";
+      const text = (automation.name + " " + automation.trigger).toLowerCase();
+      return text.includes(window);
+    });
+
+    if (!matched) {
+      // Debug: log what each automation resolved to
+      if (activeRef.current.length > 0) {
+        console.log("[checkAutomations] currentMinutes:", currentMinutes, "active:", activeRef.current.map(a => ({
+          name: a.name,
+          trigger: a.trigger,
+          start: getAutomationStartMinutes(a),
+        })));
+      }
+      return;
+    }
+    // Cooldown — don't re-fire the same automation twice
+    if (lastAnnouncedAutoRef.current === matched.id) return;
+    lastAnnouncedAutoRef.current = matched.id;
+
+    // Auto-execute the device action
+    const parsed = parseActionToDevice(matched.action, DEVICE_CONFIG);
+    if (parsed) {
+      setHouseState((prev) => ({
+        ...prev,
+        devices: { ...prev.devices, [parsed.deviceId as DeviceId]: parsed.state },
+      }));
+    }
+
+    const actionDesc = parsed
+      ? `Turning ${parsed.state ? "on" : "off"} ${DEVICE_CONFIG[parsed.deviceId as DeviceId]?.label ?? parsed.deviceId} for your ${matched.name}.`
+      : `Running your ${matched.name} routine now.`;
+
+    speak(actionDesc);
+    setReasoningAndSpeak({
+      message: `✅ ${matched.name} triggered!`,
+      detail: actionDesc,
+    });
+  }, [speak, setReasoningAndSpeak]);
+
+  // Real-time interval checker (every 60s)
   useEffect(() => {
-    const checker = setInterval(() => {
-      if (activeRef.current.length === 0) return;
-      const [hStr, mStr] = latestStateRef.current.time.split(":").map(Number);
-      const currentMinutes = hStr * 60 + mStr;
-
-      activeRef.current.forEach((automation) => {
-        const name = automation.name.toLowerCase();
-        let triggerWindow: [number, number] | null = null;
-        if (name.includes("morning"))   triggerWindow = [360, 540];
-        else if (name.includes("afternoon")) triggerWindow = [720, 900];
-        else if (name.includes("evening"))   triggerWindow = [1020, 1200];
-        else if (name.includes("night"))     triggerWindow = [1200, 1380];
-
-        if (!triggerWindow) return;
-        const [start] = triggerWindow;
-        const nearWindowStart = currentMinutes >= start - 15 && currentMinutes <= start + 30;
-        if (!nearWindowStart) return;
-
-        const speakTts = (text: string) => {
-          if (typeof window === "undefined" || !window.speechSynthesis) return;
-          window.speechSynthesis.cancel();
-          const utt = new SpeechSynthesisUtterance(text);
-          utt.rate = 0.95; utt.pitch = 1.0;
-          window.speechSynthesis.speak(utt);
-        };
-
-        speakTts(`I noticed it's time for your ${automation.name}. Should I activate it now?`);
-        setReasoning({
-          message: `🔔 Time for: ${automation.name}. Should I activate it?`,
-          detail: 'Tap "Yes, do it" below or say "Alexa yes" to confirm.',
-        });
-        setPendingAutomationAsk(automation.id);
-      });
+    const interval = setInterval(() => {
+      const [h, m] = latestStateRef.current.time.split(":").map(Number);
+      checkAutomations(h * 60 + m);
     }, 60000);
-
-    return () => clearInterval(checker);
-  }, []);
+    return () => clearInterval(interval);
+  }, [checkAutomations]);
 
   // ── Entry Point 1 & 2: POST state to AI ───────────────
-  // Called on device toggle (debounced 800ms) and audio event (immediate).
-  const sendStateToAI = useCallback(async (state: HouseState) => {
+  // FROM thinking-and-suggestion: proper "Thinking..." state + selective speak
+  const sendStateToAI = useCallback(async (state: HouseState, onTimes?: Partial<Record<DeviceId, number>>) => {
     setIsThinking(true);
     setReasoning((p) => ({ ...p, message: "Thinking..." }));
     try {
       const res = await fetch("/api/event", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ houseState: state, sourceProfile: "parents" }),
+        body: JSON.stringify({ houseState: state, sourceProfile: "parents", deviceOnTimes: onTimes ?? {} }),
       });
       const data = await res.json();
       if (data.success) {
         const { message, reasoning: r, action_type, suggested_automation } = data.data;
         setReasoning({ message, detail: r || "" });
-        if (action_type === "routine_suggestion" && suggested_automation) {
+        // Speak for meaningful events
+        const shouldSpeak = ["alert", "anomaly", "family_connect", "routine_suggestion"].includes(action_type);
+        if (shouldSpeak) speak(message);
+        // Show suggestion card whenever the AI provides one — regardless of action_type
+        if (suggested_automation) {
           setSuggested((prev) => {
             if (prev.find((a) => a.name === suggested_automation.name)) return prev;
             return [{ id: Date.now().toString(), ...suggested_automation, reasoning: r }, ...prev];
@@ -213,112 +347,62 @@ export default function Home() {
       setReasoning({ message: "Could not reach AI.", detail: "Check API connection." });
     }
     setIsThinking(false);
-  }, []);
+  }, [speak]);
 
-  // ── Device toggle (Entry Point 1) ──────────────────────
+  // ── Device toggle ──────────────────────────────────────
   const toggleDevice = useCallback((deviceId: DeviceId) => {
+    const currentMinutes = (() => {
+      const [h, m] = latestStateRef.current.time.split(":").map(Number);
+      return h * 60 + m;
+    })();
+    setDeviceOnTimes((prev) => {
+      const next = { ...prev };
+      if (!latestStateRef.current.devices[deviceId]) {
+        // turning ON — record current slider time
+        next[deviceId] = currentMinutes;
+      } else {
+        // turning OFF — remove the on-time
+        delete next[deviceId];
+      }
+      return next;
+    });
     setHouseState((prev) => {
       const next = { ...prev, devices: { ...prev.devices, [deviceId]: !prev.devices[deviceId] } };
       if (debounceRef.current) clearTimeout(debounceRef.current);
-      debounceRef.current = setTimeout(() => sendStateToAI(next), 800);
+      debounceRef.current = setTimeout(() => {
+        setDeviceOnTimes((onTimes) => { sendStateToAI(next, onTimes); return onTimes; });
+      }, 800);
       return next;
     });
   }, [sendStateToAI]);
 
   // ── Handle device command from AlexaVoiceController ────
-  // Supports optional delay (e.g. "turn off kitchen light in 10 minutes")
+  // FROM main-2: delayed commands use time-slider targeting, not real setTimeout
   const handleDeviceCommand = useCallback((deviceId: DeviceId, state: boolean, delayMs: number) => {
-    const applyToggle = () =>
+    if (delayMs > 0) {
+      const delayMinutes = Math.round(delayMs / 60000);
+      const [h, m] = latestStateRef.current.time.split(":").map(Number);
+      const targetMinutes = (h * 60 + m + delayMinutes) % 1440;
+      setPendingCommands((prev) => [...prev, { deviceId, state, targetMinutes }]);
+      const th = Math.floor(targetMinutes / 60);
+      const tm = targetMinutes % 60;
+      const ampm = th < 12 ? "AM" : "PM";
+      const th12 = th === 0 ? 12 : th > 12 ? th - 12 : th;
+      showToast(`Scheduled ${DEVICE_CONFIG[deviceId].label} to turn ${state ? "on" : "off"} at ${th12}:${String(tm).padStart(2, "0")} ${ampm}`, "success");
+    } else {
       setHouseState((prev) => ({
         ...prev,
         devices: { ...prev.devices, [deviceId]: state },
       }));
-
-    if (delayMs > 0) {
-      setTimeout(applyToggle, delayMs);
-    } else {
-      applyToggle();
     }
-  }, []);
+  }, [showToast]);
 
-  // ── Handle AI response from voice controller ────────────
-  // Updates the reasoning panel so the judge can see what Alexa decided.
+  // ── Handle AI response from voice controller ───────────
   const handleVoiceAIResponse = useCallback((message: string, detail: string) => {
-    setReasoning({ message, detail });
-  }, []);
+    setReasoningAndSpeak({ message, detail });
+  }, [setReasoningAndSpeak]);
 
-  // ── Optimistic remove with rollback (Req 7.1, 7.2, 7.3) ──
-  const handleRemoveAutomation = useCallback(async (automationId: string) => {
-    let removedItem: ActiveAutomation | undefined;
-    let removedIndex = -1;
-
-    setActive((prev) => {
-      removedIndex = prev.findIndex((x) => x.id === automationId);
-      removedItem = prev[removedIndex];
-      return prev.filter((x) => x.id !== automationId);
-    });
-
-    try {
-      const res = await fetch(`/api/automations?id=${encodeURIComponent(automationId)}`, {
-        method: "DELETE",
-      });
-      const data = await res.json();
-      if (data.success) {
-        showToast("Automation removed.");
-      } else {
-        throw new Error(data.error || "Server error");
-      }
-    } catch {
-      // Rollback — restore at original position
-      if (removedItem !== undefined) {
-        const item = removedItem;
-        const idx = removedIndex;
-        setActive((prev) => {
-          const next = [...prev];
-          next.splice(idx, 0, item);
-          return next;
-        });
-      }
-      showToast("Failed to remove automation. Please try again.", "error");
-    }
-  }, [showToast]);
-
-  // ── Seed demo data (for presentation resets) ───────────
-  const handleSeed = useCallback(async () => {
-    setIsSeedLoading(true);
-    try {
-      const res  = await fetch("/api/seed?force=true");
-      const data = await res.json();
-      if (data.success) {
-        showToast(data.message || "Demo data seeded!", "success");
-        // Refresh patterns panel
-        fetch("/api/routines")
-          .then((r) => r.json())
-          .then((d) => { if (d.success && d.routines?.length) setPatterns(d.routines); })
-          .catch(() => {});
-      } else {
-        showToast(data.reason || data.error || "Seed failed", "error");
-      }
-    } catch {
-      showToast("Network error — check connection", "error");
-    }
-    setIsSeedLoading(false);
-  }, [showToast]);
-
-  // ── Time slider ────────────────────────────────────────
-  const handleTimeChange = useCallback((minutes: number) => {
-    const h    = Math.floor(minutes / 60);
-    const m    = minutes % 60;
-    const time = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
-    setHouseState((prev) => {
-      const next = { ...prev, time };
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-      debounceRef.current = setTimeout(() => sendStateToAI(next), 800);
-      return next;
-    });
-  }, [sendStateToAI]);
-
-  // ── Automate This — optimistic add with POST rollback ─
+  // ── Optimistic "Automate This" with POST + rollback ────
   const handleAutomateThis = useCallback(async (automation: SuggestedAutomation) => {
     const newActive: ActiveAutomation = {
       id: automation.id,
@@ -327,11 +411,8 @@ export default function Home() {
       action: automation.action,
       reasoning: automation.reasoning,
     };
-
-    // Optimistic update
     setActive((prev) => [...prev, newActive]);
     setSuggested((prev) => prev.filter((x) => x.id !== automation.id));
-
     try {
       const res = await fetch("/api/automations", {
         method: "POST",
@@ -352,6 +433,112 @@ export default function Home() {
     }
   }, [showToast]);
 
+  // ── Optimistic "Remove" with DELETE + rollback ─────────
+  const handleRemoveAutomation = useCallback(async (automationId: string) => {
+    let removedItem: ActiveAutomation | undefined;
+    let removedIndex = -1;
+    setActive((prev) => {
+      removedIndex = prev.findIndex((x) => x.id === automationId);
+      removedItem = prev[removedIndex];
+      return prev.filter((x) => x.id !== automationId);
+    });
+    try {
+      const res = await fetch(`/api/automations?id=${encodeURIComponent(automationId)}`, { method: "DELETE" });
+      const data = await res.json();
+      if (data.success) {
+        showToast("Automation removed.");
+      } else {
+        throw new Error(data.error || "Server error");
+      }
+    } catch {
+      if (removedItem !== undefined) {
+        const item = removedItem;
+        const idx  = removedIndex;
+        setActive((prev) => { const next = [...prev]; next.splice(idx, 0, item); return next; });
+      }
+      showToast("Failed to remove automation. Please try again.", "error");
+    }
+  }, [showToast]);
+
+  // ── Seed demo data ─────────────────────────────────────
+  const handleSeed = useCallback(async () => {
+    setIsSeedLoading(true);
+    try {
+      const res  = await fetch("/api/seed?force=true");
+      const data = await res.json();
+      if (data.success) {
+        showToast(data.message || "Demo data seeded!", "success");
+        fetch("/api/routines").then((r) => r.json()).then((d) => { if (d.success && d.routines?.length) setPatterns(d.routines); }).catch(() => {});
+      } else {
+        showToast(data.reason || data.error || "Seed failed", "error");
+      }
+    } catch {
+      showToast("Network error — check connection", "error");
+    }
+    setIsSeedLoading(false);
+  }, [showToast]);
+
+  // ── Time slider — FROM main-2 ──────────────────────────
+  // Full 24h range (0–1439), time-period greetings, pending command execution, checkAutomations
+  const handleTimeChange = useCallback((minutes: number) => {
+    const h    = Math.floor(minutes / 60);
+    const m    = minutes % 60;
+    const time = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+
+    // Time-period greetings
+    const period =
+      minutes < 360  ? "midnight" :
+      minutes < 480  ? "morning" :
+      minutes < 720  ? "late_morning" :
+      minutes < 900  ? "afternoon" :
+      minutes < 1020 ? "evening" :
+      minutes < 1200 ? "night" : "late_night";
+
+    const greetings: Record<string, string> = {
+      morning:      "Good morning! It's 6 AM. The house is quiet. Should I start your morning routine?",
+      late_morning: "Good morning! It's a new day. Kitchen devices are ready when you are.",
+      afternoon:    "Good afternoon! Lunch time. Shall I check if the kitchen is in use?",
+      evening:      "Good evening! The family is likely home. Study hours may be starting soon.",
+      night:        "It's evening. TV time perhaps? I'll keep an ear out for any activity.",
+      late_night:   "It's getting late. Most devices should be off. Should I check the house?",
+    };
+
+    if (greetings[period] && lastGreetedPeriodRef.current !== period) {
+      lastGreetedPeriodRef.current = period;
+      speak(greetings[period]);
+      setReasoning({ message: greetings[period], detail: "" });
+    }
+
+    // Fire any pending voice commands that fall within this time window
+    const triggered: typeof pendingCommands = [];
+    const remaining: typeof pendingCommands = [];
+    pendingCommandsRef.current.forEach((cmd) => {
+      if (minutes >= cmd.targetMinutes && minutes <= cmd.targetMinutes + 60) {
+        triggered.push(cmd);
+      } else {
+        remaining.push(cmd);
+      }
+    });
+    if (triggered.length > 0) {
+      setPendingCommands(remaining);
+      showToast("Executed scheduled voice command!", "success");
+    }
+
+    setHouseState((prev) => {
+      const nextDevices = { ...prev.devices };
+      triggered.forEach((cmd) => { nextDevices[cmd.deviceId] = cmd.state; });
+      const next = { ...prev, devices: nextDevices, time };
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      debounceRef.current = setTimeout(() => {
+        setDeviceOnTimes((onTimes) => { sendStateToAI(next, onTimes); return onTimes; });
+      }, 800);
+      return next;
+    });
+
+    // Check active automations immediately when slider moves
+    checkAutomations(minutes);
+  }, [sendStateToAI, checkAutomations, speak, showToast]);
+
   const formatTimeDisplay = (time: string) => {
     const [hStr, mStr] = time.split(":");
     const h    = parseInt(hStr);
@@ -365,9 +552,7 @@ export default function Home() {
     return h * 60 + m;
   })();
 
-  // ── Entry Point 2: YAMNet audio event handler ──────────
-  // Called by YAMNetAudioMonitor when a sustained sound is confirmed.
-  // Fires immediately (no debounce) to /api/event.
+  // ── YAMNet audio event handler ─────────────────────────
   const handleAudioEvent = useCallback((classification: string) => {
     const roomMap: Partial<Record<string, { roomId: RoomId; type: AlertType }>> = {
       baby_crying:             { roomId: "bedroom", type: "attention" },
@@ -384,28 +569,19 @@ export default function Home() {
     };
     const mapped     = roomMap[classification] ?? { roomId: "living" as RoomId, type: "info" as AlertType };
     const audioEvent: AudioEvent = { roomId: mapped.roomId, type: mapped.type, label: classification };
-
     setHouseState((prev) => {
       const next = { ...prev, audioEvents: [audioEvent] };
-      sendStateToAI(next); // Immediate — no debounce for audio
+      setDeviceOnTimes((onTimes) => { sendStateToAI(next, onTimes); return onTimes; });
       return next;
     });
-
-    // Clear room flash after 8s
-    setTimeout(() => {
-      setHouseState((prev) => ({ ...prev, audioEvents: [] }));
-    }, 8000);
+    setTimeout(() => { setHouseState((prev) => ({ ...prev, audioEvents: [] })); }, 8000);
   }, [sendStateToAI]);
 
   // ── Room alert CSS class ───────────────────────────────
   const getRoomAlertClass = (roomId: RoomId) => {
     const ev = houseState.audioEvents.find((e) => e.roomId === roomId);
     if (!ev) return "";
-    return ev.type === "danger"
-      ? "room-alert-danger"
-      : ev.type === "attention"
-      ? "room-alert-attention"
-      : "room-alert-info";
+    return ev.type === "danger" ? "room-alert-danger" : ev.type === "attention" ? "room-alert-attention" : "room-alert-info";
   };
 
   // ─────────────────────────────────────────────────────────
@@ -430,16 +606,7 @@ export default function Home() {
         .time-range-labels span{font-size:10px;color:var(--text-dim);white-space:nowrap}
         .nav-right{flex-shrink:0;display:flex;align-items:center;gap:10px}
 
-        /* Seed Demo button — small, amber-tinted, not prominent */
-        .seed-btn{
-          height:28px;padding:0 10px;
-          background:rgba(245,158,11,0.08);
-          border:1px solid rgba(245,158,11,0.25);
-          border-radius:6px;cursor:pointer;
-          font-size:11px;font-weight:600;color:var(--amber);
-          display:flex;align-items:center;gap:5px;
-          transition:background .2s,border-color .2s;white-space:nowrap
-        }
+        .seed-btn{height:28px;padding:0 10px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.25);border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;color:var(--amber);display:flex;align-items:center;gap:5px;transition:background .2s,border-color .2s;white-space:nowrap}
         .seed-btn:hover{background:rgba(245,158,11,0.18);border-color:rgba(245,158,11,0.5)}
         .seed-btn:disabled{opacity:0.45;cursor:not-allowed}
 
@@ -516,32 +683,24 @@ export default function Home() {
       <nav className="navbar">
         <span className="nav-brand">⚡ Alexa Ambient</span>
 
-        {/* Time slider — simulates time of day for demo */}
+        {/* Full 24h time slider — FROM main-2 */}
         <div className="nav-slider-wrap">
           <span className="time-label">{formatTimeDisplay(houseState.time)}</span>
           <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
             <input
-              type="range" min={360} max={1380} step={15}
+              type="range" min={0} max={1439} step={15}
               value={timeMinutes}
               onChange={(e) => handleTimeChange(parseInt(e.target.value))}
               style={{ flex: 1, height: 4, accentColor: "#f59e0b", cursor: "pointer" }}
             />
-            <div className="time-range-labels"><span>6:00 AM</span><span>11:00 PM</span></div>
+            <div className="time-range-labels"><span>12:00 AM</span><span>11:59 PM</span></div>
           </div>
         </div>
 
         <div className="nav-right">
-          {/* Seed Demo Data — small utility button for presentation resets */}
-          <button
-            className="seed-btn"
-            onClick={handleSeed}
-            disabled={isSeedLoading}
-            title="Seed 5 days of realistic household data into DynamoDB"
-          >
+          <button className="seed-btn" onClick={handleSeed} disabled={isSeedLoading} title="Seed 5 days of realistic household data into DynamoDB">
             {isSeedLoading ? "⏳" : "🌱"} {isSeedLoading ? "Seeding..." : "Seed Demo"}
           </button>
-
-          {/* Entry Point 3: Alexa Voice Controller */}
           <AlexaVoiceController
             houseState={houseState}
             onDeviceCommand={handleDeviceCommand}
@@ -564,9 +723,7 @@ export default function Home() {
               <div className="room-header">
                 <span className="room-name">{room.label}</span>
                 <span className="room-alert-tag">
-                  {houseState.audioEvents
-                    .find((e) => e.roomId === room.id)
-                    ?.label.replace(/_/g, " ") || "Alert"}
+                  {houseState.audioEvents.find((e) => e.roomId === room.id)?.label.replace(/_/g, " ") || "Alert"}
                 </span>
               </div>
               <div className="devices">
@@ -597,50 +754,17 @@ export default function Home() {
         {/* ── SIDEBAR ─────────────────────────────────────── */}
         <aside className="sidebar">
 
-          {/* Card 1: AI Reasoning panel */}
+          {/* Card 1: AI Reasoning — FROM thinking-and-suggestion: "Thinking..." state */}
           <div className="sidebar-card">
             <div className="card-title">
               <span className="pulse-dot" style={{ opacity: isThinking ? 1 : 0.3 }}></span>
               🧠 Alexa is Thinking...
             </div>
             <p className="card-body">{reasoning.message}</p>
-            {reasoning.detail && (
-              <p className="card-body-detail">💡 {reasoning.detail}</p>
-            )}
-            {/* Automation confirmation buttons (shown after proactive TTS ask) */}
-            {pendingAutomationAsk && (
-              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                <button
-                  className="btn-green"
-                  onClick={() => {
-                    const auto = active.find((a) => a.id === pendingAutomationAsk);
-                    if (auto) {
-                      setReasoning({ message: `✅ ${auto.name} activated!`, detail: "Automation executed." });
-                      if (window.speechSynthesis) {
-                        window.speechSynthesis.cancel();
-                        const utt = new SpeechSynthesisUtterance(`Done! I've activated your ${auto.name}.`);
-                        window.speechSynthesis.speak(utt);
-                      }
-                    }
-                    setPendingAutomationAsk(null);
-                  }}
-                >
-                  Yes, do it
-                </button>
-                <button
-                  className="btn-muted"
-                  onClick={() => {
-                    setPendingAutomationAsk(null);
-                    setReasoning({ message: "Okay, skipping this time.", detail: "" });
-                  }}
-                >
-                  Skip
-                </button>
-              </div>
-            )}
+            {reasoning.detail && <p className="card-body-detail">💡 {reasoning.detail}</p>}
           </div>
 
-          {/* Card 2: Suggested Automations */}
+          {/* Card 2: Suggested Automations — FROM thinking-and-suggestion */}
           <div className="sidebar-card">
             <div className="card-title">⚡ Suggested Automations</div>
             {suggested.length === 0 ? (
@@ -654,16 +778,10 @@ export default function Home() {
                     💡 {a.reasoning}
                   </div>
                   <div className="auto-item-btns">
-                    <button
-                      className="btn-green"
-                      onClick={() => handleAutomateThis(a)}
-                    >
+                    <button className="btn-green" onClick={() => handleAutomateThis(a)}>
                       Automate This
                     </button>
-                    <button
-                      className="btn-muted"
-                      onClick={() => setSuggested((p) => p.filter((x) => x.id !== a.id))}
-                    >
+                    <button className="btn-muted" onClick={() => setSuggested((p) => p.filter((x) => x.id !== a.id))}>
                       Dismiss
                     </button>
                   </div>
@@ -672,7 +790,7 @@ export default function Home() {
             )}
           </div>
 
-          {/* Card 3: Active Automations */}
+          {/* Card 3: Active Automations — with trigger time label */}
           <div className="sidebar-card">
             <div className="card-title">✅ Active Automations</div>
             {active.length === 0 ? (
@@ -684,17 +802,14 @@ export default function Home() {
                     <span className="active-dot"></span>
                     <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
                       <span className="active-name">{a.name}</span>
-                      {getAutomationTimeLabel(a.name) && (
+                      {getAutomationTimeLabel(a) && (
                         <span style={{ fontSize: 10, color: "var(--amber)", fontWeight: 600 }}>
-                          ⏰ {getAutomationTimeLabel(a.name)}
+                          ⏰ {getAutomationTimeLabel(a)}
                         </span>
                       )}
                     </div>
                   </div>
-                  <button
-                    className="btn-remove"
-                    onClick={() => handleRemoveAutomation(a.id)}
-                  >
+                  <button className="btn-remove" onClick={() => handleRemoveAutomation(a.id)}>
                     Remove
                   </button>
                 </div>
@@ -702,7 +817,7 @@ export default function Home() {
             )}
           </div>
 
-          {/* Card 4: Household Patterns (from DynamoDB aggregation) */}
+          {/* Card 4: Household Patterns */}
           <div className="sidebar-card">
             <div className="card-title">📊 Household Patterns</div>
             {patterns.map((r, i) => (
@@ -716,7 +831,7 @@ export default function Home() {
             ))}
           </div>
 
-          {/* Card 5: Entry Point 2 — YAMNet Audio Monitor */}
+          {/* Card 5: YAMNet Audio Monitor */}
           <div className="sidebar-card">
             <div className="card-title">🎙️ Audio Monitor</div>
             <div className="yamnet-wrap">
@@ -729,26 +844,15 @@ export default function Home() {
 
       {/* ── Toast notification ─────────────────────────── */}
       {toast && (
-        <div
-          style={{
-            position: "fixed",
-            bottom: 24,
-            right: 24,
-            background: toast.type === "success" ? "var(--green)" : "var(--red)",
-            color: "#fff",
-            padding: "12px 20px",
-            borderRadius: 10,
-            fontSize: 13,
-            fontWeight: 600,
-            zIndex: 9999,
-            boxShadow: "0 4px 28px rgba(0,0,0,0.55)",
-            animation: "toastIn 0.3s ease",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-          }}
-        >
-          {toast.type === "success" ? "✅" : "❌"} {toast.message}
+        <div style={{
+          position: "fixed", bottom: 24, right: 24,
+          background: toast.type === "error" ? "var(--red)" : "var(--green)",
+          color: "#fff", padding: "12px 20px", borderRadius: 10,
+          fontSize: 13, fontWeight: 600, zIndex: 9999,
+          boxShadow: "0 4px 28px rgba(0,0,0,0.55)", animation: "toastIn 0.3s ease",
+          display: "flex", alignItems: "center", gap: 8,
+        }}>
+          {toast.type === "error" ? "❌" : "✅"} {toast.message}
         </div>
       )}
     </>

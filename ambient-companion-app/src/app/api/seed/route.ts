@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
 import { dynamoDb } from '@/lib/dynamodb';
 import { PutCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 
+export const dynamic = 'force-dynamic';
+
 // 5 days of realistic Indian household patterns
 // Morning: geyser + bedroom_light (7AM), water_motor (7:15AM), puja bell (7:30AM)
 // Afternoon: pressure_cooker_whistle (1PM), kitchen_light on
