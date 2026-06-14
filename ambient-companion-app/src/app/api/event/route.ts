@@ -158,7 +158,7 @@ action_type: routine_suggestion=pattern worth automating, alert=safety/urgent, f
 target_profile for family_connect: use the OTHER profile (if ${sourceProfile} is parents, target is children)
 For voice_command_execute: set device_command.deviceId to exact device, state=true for on/false for off, delay_minutes=0 for immediate. Set device_command to null for non-device commands.`;
 
-    // 4. Call Groq
+    // 4. Call LM Studio (local, OpenAI-compatible)
     let aiDecision: {
       action_type: string;
       target_profile: string;
@@ -167,28 +167,26 @@ For voice_command_execute: set device_command.deviceId to exact device, state=tr
       suggested_automation: { name: string; trigger: string; action: string } | null;
     } | null = null;
 
-    if (process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "paste_your_groq_key_here") {
-      try {
-        const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
-          body: JSON.stringify({
-            messages: [
-              { role: "system", content: SYSTEM_PROMPT },
-              { role: "user", content: USER_PROMPT },
-            ],
-            model: "llama-3.3-70b-versatile",
-            temperature: 0.2,
-          }),
-        });
-        if (res.ok) {
-          const groqData = await res.json();
-          let content = groqData?.choices?.[0]?.message?.content?.trim() || "";
-          content = content.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
-          aiDecision = JSON.parse(content);
-        }
-      } catch (e) { console.error("Groq failed:", e); }
-    }
+    try {
+      const res = await fetch("http://127.0.0.1:1234/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            { role: "user", content: USER_PROMPT },
+          ],
+          model: "meta-llama-3.1-8b-instruct",
+          temperature: 0.2,
+        }),
+      });
+      if (res.ok) {
+        const lmData = await res.json();
+        let content = lmData?.choices?.[0]?.message?.content?.trim() || "";
+        content = content.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+        aiDecision = JSON.parse(content);
+      }
+    } catch (e) { console.error("LM Studio call failed (is it running on 1234?):", e); }
 
     // 5. Fallback
     if (!aiDecision) {

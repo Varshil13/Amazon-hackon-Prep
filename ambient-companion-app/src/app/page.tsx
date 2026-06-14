@@ -82,6 +82,16 @@ function FanIcon({ spinning }: { spinning: boolean }) {
   );
 }
 
+// ─── Automation helpers ───────────────────────────────────
+function getAutomationTimeLabel(name: string): string {
+  const n = name.toLowerCase();
+  if (n.includes("morning"))   return "6:00 AM";
+  if (n.includes("afternoon")) return "12:00 PM";
+  if (n.includes("evening"))   return "5:00 PM";
+  if (n.includes("night"))     return "8:00 PM";
+  return "";
+}
+
 // ─── Main Page ────────────────────────────────────────────
 export default function Home() {
   const [houseState, setHouseState] = useState<HouseState>({
@@ -672,7 +682,14 @@ export default function Home() {
                 <div key={a.id} className="active-item">
                   <div className="active-item-left">
                     <span className="active-dot"></span>
-                    <span className="active-name">{a.name}</span>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                      <span className="active-name">{a.name}</span>
+                      {getAutomationTimeLabel(a.name) && (
+                        <span style={{ fontSize: 10, color: "var(--amber)", fontWeight: 600 }}>
+                          ⏰ {getAutomationTimeLabel(a.name)}
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <button
                     className="btn-remove"
