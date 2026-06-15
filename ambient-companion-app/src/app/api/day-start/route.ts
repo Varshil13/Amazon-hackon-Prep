@@ -1,15 +1,9 @@
 import { NextResponse } from "next/server";
-import { dynamoDb } from "@/lib/dynamodb";
+import { dynamoDb, isAwsConfigured } from "@/lib/dynamodb";
 import { PutCommand, ScanCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 import { getPossibleAutomations } from "@/app/api/possible-automations/route";
 
 const ACTIVE_TABLE = "ActiveAutomations";
-
-const isAwsConfigured = !!(
-  process.env.AWS_ACCESS_KEY_ID &&
-  process.env.AWS_ACCESS_KEY_ID !== "paste_your_access_key_here" &&
-  process.env.AWS_ACCESS_KEY_ID !== "dummy"
-);
 
 // Called when user advances to a new day.
 // Fetches last 3 days from PossibleAutomations, sends to LLM,

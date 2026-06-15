@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
-import { dynamoDb } from "@/lib/dynamodb";
+import { dynamoDb, isAwsConfigured } from "@/lib/dynamodb";
 import { ScanCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 
 export async function GET() {
-  if (!process.env.AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID === "paste_your_access_key_here" || process.env.AWS_ACCESS_KEY_ID === "dummy") {
+  if (!isAwsConfigured) {
     // If DynamoDB is not configured yet, tell frontend to rely on local state
     return NextResponse.json({ success: false, reason: "No AWS keys configured" });
   }
@@ -28,7 +28,7 @@ export async function GET() {
 }
 
 export async function DELETE() {
-  if (!process.env.AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID === "paste_your_access_key_here") {
+  if (!isAwsConfigured) {
     return NextResponse.json({ success: false, reason: "No AWS keys configured" });
   }
   try {

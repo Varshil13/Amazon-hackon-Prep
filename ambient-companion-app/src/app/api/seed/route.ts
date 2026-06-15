@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { dynamoDb } from '@/lib/dynamodb';
+import { dynamoDb, isAwsConfigured } from '@/lib/dynamodb';
 import { PutCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 
 export const dynamic = 'force-dynamic';
@@ -48,12 +48,6 @@ const SEED_EVENTS = [
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const force = searchParams.get("force") === "true";
-
-  const isAwsConfigured = !!(
-    process.env.AWS_ACCESS_KEY_ID &&
-    process.env.AWS_ACCESS_KEY_ID !== 'paste_your_access_key_here' &&
-    process.env.AWS_ACCESS_KEY_ID !== 'dummy'
-  );
 
   if (!isAwsConfigured) {
     return NextResponse.json({ success: false, reason: 'AWS not configured' });

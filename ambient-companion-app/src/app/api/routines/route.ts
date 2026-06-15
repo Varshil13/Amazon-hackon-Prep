@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { dynamoDb } from "@/lib/dynamodb";
+import { dynamoDb, isAwsConfigured } from "@/lib/dynamodb";
 import { ScanCommand } from "@aws-sdk/lib-dynamodb";
 
 // Mode: most frequently occurring value in an array
@@ -39,12 +39,6 @@ const MOCK_SESSIONS = [
 ];
 
 export async function GET() {
-  const isAwsConfigured = !!(
-    process.env.AWS_ACCESS_KEY_ID &&
-    process.env.AWS_ACCESS_KEY_ID !== "paste_your_access_key_here" &&
-    process.env.AWS_ACCESS_KEY_ID !== "dummy"
-  );
-
   if (!isAwsConfigured) {
     return NextResponse.json({ success: true, routines: [], sessions: [] });
   }

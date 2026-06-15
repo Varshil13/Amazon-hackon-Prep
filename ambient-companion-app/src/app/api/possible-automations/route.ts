@@ -1,14 +1,8 @@
 import { NextResponse } from "next/server";
-import { dynamoDb } from "@/lib/dynamodb";
+import { dynamoDb, isAwsConfigured } from "@/lib/dynamodb";
 import { PutCommand, ScanCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 
 const TABLE = "PossibleAutomations";
-
-const isAwsConfigured = !!(
-  process.env.AWS_ACCESS_KEY_ID &&
-  process.env.AWS_ACCESS_KEY_ID !== "paste_your_access_key_here" &&
-  process.env.AWS_ACCESS_KEY_ID !== "dummy"
-);
 
 // POST — log a manual device toggle event
 export async function POST(request: Request) {

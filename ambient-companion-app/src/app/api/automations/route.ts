@@ -1,13 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { dynamoDb } from "@/lib/dynamodb";
+import { dynamoDb, isAwsConfigured } from "@/lib/dynamodb";
 import { ScanCommand, PutCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 
 const TABLE = "ActiveAutomations";
-
-const isAwsConfigured =
-  !!process.env.AWS_ACCESS_KEY_ID &&
-  process.env.AWS_ACCESS_KEY_ID !== "paste_your_access_key_here" &&
-  process.env.AWS_ACCESS_KEY_ID !== "dummy";
 
 export async function GET() {
   if (!isAwsConfigured) {

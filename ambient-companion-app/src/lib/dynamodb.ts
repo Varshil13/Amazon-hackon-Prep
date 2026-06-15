@@ -13,3 +13,10 @@ const client = new DynamoDBClient({
 });
 
 export const dynamoDb = DynamoDBDocumentClient.from(client);
+
+// True when real AWS credentials are present (under either the APP_AWS_* name
+// used on Amplify or the classic AWS_* name used locally).
+export const isAwsConfigured =
+  !!accessKeyId &&
+  accessKeyId !== "dummy" &&
+  accessKeyId !== "paste_your_access_key_here";

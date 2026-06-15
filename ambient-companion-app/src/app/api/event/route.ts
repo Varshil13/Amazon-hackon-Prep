@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { dynamoDb } from "@/lib/dynamodb";
+import { dynamoDb, isAwsConfigured } from "@/lib/dynamodb";
 import { PutCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 
 const DEVICE_MANIFEST = `AVAILABLE DEVICES IN THIS HOME:
@@ -71,12 +71,6 @@ export async function POST(request: Request) {
     const effectiveHouseState = isLegacy
       ? { devices: {}, time: body.timeOfDay || "12:00", audioEvents: [{ roomId: "living", type: "info", label: body.classification }] }
       : houseState;
-
-    const isAwsConfigured = !!(
-      process.env.AWS_ACCESS_KEY_ID &&
-      process.env.AWS_ACCESS_KEY_ID !== "paste_your_access_key_here" &&
-      process.env.AWS_ACCESS_KEY_ID !== "dummy"
-    );
 
     // 1. Short-term memory & 2. Routine profile (Merged Scan)
     // OPTIMIZATION: Skip DynamoDB scan entirely for voice commands.
