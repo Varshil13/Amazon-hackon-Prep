@@ -23,6 +23,7 @@ export async function GET() {
       reasoning: item.reasoning,
       userApproved: item.userApproved ?? false,
       time: item.time ?? null,
+      device: item.device ?? null,
     }));
     return NextResponse.json({ success: true, automations });
   } catch (error: unknown) {
@@ -45,7 +46,7 @@ export async function POST(request: NextRequest) {
   }
   try {
     await dynamoDb.send(
-      new PutCommand({ TableName: TABLE, Item: { id, name, trigger, action, reasoning, userApproved: body.userApproved ?? false, ...(body.time ? { time: body.time } : {}) } })
+      new PutCommand({ TableName: TABLE, Item: { id, name, trigger, action, reasoning, userApproved: body.userApproved ?? false, ...(body.time ? { time: body.time } : {}), ...(body.device ? { device: body.device } : {}) } })
     );
     return NextResponse.json({ success: true });
   } catch (error: unknown) {
@@ -91,8 +92,8 @@ export async function PATCH(request: NextRequest) {
     );
     // Write the new list
     await Promise.all(
-      automations.map((a: { id: string; name: string; trigger: string; action: string; reasoning: string; userApproved?: boolean; time?: string }) =>
-        dynamoDb.send(new PutCommand({ TableName: TABLE, Item: { id: a.id, name: a.name, trigger: a.trigger, action: a.action, reasoning: a.reasoning, userApproved: a.userApproved ?? false, ...(a.time ? { time: a.time } : {}) } }))
+      automations.map((a: { id: string; name: string; trigger: string; action: string; reasoning: string; userApproved?: boolean; time?: string; device?: string }) =>
+        dynamoDb.send(new PutCommand({ TableName: TABLE, Item: { id: a.id, name: a.name, trigger: a.trigger, action: a.action, reasoning: a.reasoning, userApproved: a.userApproved ?? false, ...(a.time ? { time: a.time } : {}), ...(a.device ? { device: a.device } : {}) } }))
       )
     );
     return NextResponse.json({ success: true });

@@ -29,7 +29,7 @@ interface HouseState { devices: Record<DeviceId, boolean>; time: string; audioEv
 
 // Full 5-field shape — persisted to DynamoDB
 interface SuggestedAutomation { id: string; name: string; trigger: string; action: string; reasoning: string; }
-interface ActiveAutomation    { id: string; name: string; trigger: string; action: string; reasoning: string; userApproved?: boolean; time?: string; }
+interface ActiveAutomation    { id: string; name: string; trigger: string; action: string; reasoning: string; userApproved?: boolean; time?: string; device?: string; }
 interface RoutinePattern { event: string; occurrences: number; typical_window: string; confidence: string; }
 
 // ─── Static Config ────────────────────────────────────────
@@ -134,10 +134,13 @@ function parseActionToDevice(
 // 2. action field: "turn on X at 7 AM"
 // 3. top-level time field (stored separately in DB)
 function buildQueueFromAutomation(
-  auto: { id: string; name: string; trigger: string; action: string; time?: string },
+  auto: { id: string; name: string; trigger: string; action: string; time?: string; device?: string },
   deviceConfig: Record<string, { label: string; room: string }>
 ): { time: string; device: string; action: boolean }[] {
   const results: { time: string; device: string; action: boolean }[] = [];
+
+  // Priority 1: use explicit device field if it's a valid device ID
+  const explicitDevice = auto.device && deviceConfig[auto.device] ? auto.device : null;
 
   // Detect device from name or action — sort by length desc to match longer names first
   const findDevice = (text: string): string | null => {
@@ -159,7 +162,7 @@ function buildQueueFromAutomation(
     return null;
   };
 
-  const deviceId = findDevice(auto.name) || findDevice(auto.action);
+  const deviceId = explicitDevice ?? findDevice(auto.name) ?? findDevice(auto.action);
   if (!deviceId) return results;
 
   // Detect on/off state from action text
@@ -226,7 +229,6 @@ export default function Home() {
   const [patterns, setPatterns]       = useState<RoutinePattern[]>([]);
   const [pendingAutomationAsk, setPendingAutomationAsk] = useState<string | null>(null);
   const [toast, setToast]             = useState<{ message: string; type: "success" | "error" | "info" } | null>(null);
-  const [isSeedLoading, setIsSeedLoading] = useState(false);
   // Scheduled voice commands — fired when time slider reaches targetMinutes
   const [pendingCommands, setPendingCommands] = useState<{ deviceId: DeviceId; state: boolean; targetMinutes: number }[]>([]);
   // Tracks the slider-minute at which each device was turned ON — used for anomaly detection
@@ -514,6 +516,22 @@ export default function Home() {
     }
   }, [showToast]);
 
+  // ── Log voice-executed device events to PossibleAutomations ──
+  const handleLogVoiceDeviceEvent = useCallback((deviceId: DeviceId, action: "on" | "off") => {
+    const [h, m] = latestStateRef.current.time.split(":").map(Number);
+    const toHHMM = (mins: number) => `${String(Math.floor(mins/60)).padStart(2,"0")}:${String(mins%60).padStart(2,"0")}`;
+    fetch("/api/possible-automations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        device: deviceId,
+        action,
+        time: toHHMM(h * 60 + m),
+        day: currentDayRef.current,
+      }),
+    }).catch(() => {});
+  }, []);
+
   // ── Handle AI response from voice controller ───────────
   const handleVoiceAIResponse = useCallback((message: string, detail: string) => {
     setReasoningAndSpeak({ message, detail });
@@ -523,7 +541,28 @@ export default function Home() {
   // Called when LLM returns action_type="automation_update" with updated_automations list
   const handleVoiceAutomationUpdate = useCallback(async (updatedAutomations: ActiveAutomation[]) => {
     // Voice-requested automations are always user-approved
-    const voiceApproved = updatedAutomations.map((a) => ({ ...a, userApproved: true }));
+    // Extract time from action text and store in time field for reliable queue building
+    const voiceApproved = updatedAutomations.map((a) => {
+      // Try to extract time from action string e.g. "turn on at 07:00" or "on at 7 AM"
+      let extractedTime: string | undefined;
+      const strictMatch = a.action.match(/(on|off)\s+at\s+(\d{1,2}:\d{2})/i);
+      if (strictMatch) {
+        extractedTime = strictMatch[2];
+      } else {
+        const ampmMatch = a.action.match(/at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+        if (ampmMatch) {
+          let h = parseInt(ampmMatch[1]);
+          const mins = ampmMatch[2] ? parseInt(ampmMatch[2]) : 0;
+          if (ampmMatch[3].toLowerCase() === "pm" && h !== 12) h += 12;
+          if (ampmMatch[3].toLowerCase() === "am" && h === 12) h = 0;
+          extractedTime = `${String(h).padStart(2,"0")}:${String(mins).padStart(2,"0")}`;
+        } else {
+          const hhmmMatch = a.action.match(/at\s+(\d{1,2}:\d{2})/i);
+          if (hhmmMatch) extractedTime = hhmmMatch[1];
+        }
+      }
+      return { ...a, userApproved: true, ...(extractedTime ? { time: extractedTime } : {}) };
+    });
 
     // Merge: keep existing approved automations, update/add voice ones by id
     const merged = [...activeRef.current];
@@ -623,24 +662,6 @@ export default function Home() {
       }
       showToast("Failed to remove automation. Please try again.", "error");
     }
-  }, [showToast]);
-
-  // ── Seed demo data ─────────────────────────────────────
-  const handleSeed = useCallback(async () => {
-    setIsSeedLoading(true);
-    try {
-      const res  = await fetch("/api/seed?force=true");
-      const data = await res.json();
-      if (data.success) {
-        showToast(data.message || "Demo data seeded!", "success");
-        fetch("/api/routines").then((r) => r.json()).then((d) => { if (d.success && d.routines?.length) setPatterns(d.routines); }).catch(() => {});
-      } else {
-        showToast(data.reason || data.error || "Seed failed", "error");
-      }
-    } catch {
-      showToast("Network error — check connection", "error");
-    }
-    setIsSeedLoading(false);
   }, [showToast]);
 
   // ── Day change — advance/retreat day, call day-start LLM, build queue ──
@@ -868,10 +889,6 @@ export default function Home() {
         .time-label{font-size:13px;font-weight:700;color:var(--amber);white-space:nowrap;min-width:90px;text-align:center}
         .nav-right{flex-shrink:0;display:flex;align-items:center;gap:10px}
 
-        .seed-btn{height:28px;padding:0 10px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.25);border-radius:6px;cursor:pointer;font-size:11px;font-weight:600;color:var(--amber);display:flex;align-items:center;gap:5px;transition:background .2s,border-color .2s;white-space:nowrap}
-        .seed-btn:hover{background:rgba(245,158,11,0.18);border-color:rgba(245,158,11,0.5)}
-        .seed-btn:disabled{opacity:0.45;cursor:not-allowed}
-
         /* ── Layout ── */
         .app{flex:1;display:flex;min-height:0;overflow:hidden}
 
@@ -977,37 +994,13 @@ export default function Home() {
         </div>
 
         <div className="nav-right">
-          <button className="seed-btn" onClick={handleSeed} disabled={isSeedLoading} title="Seed 5 days of realistic household data into DynamoDB">
-            {isSeedLoading ? "⏳" : "🌱"} {isSeedLoading ? "Seeding..." : "Seed Demo"}
-          </button>
-          <button
-            className="seed-btn"
-            title="Clear all PossibleAutomations (dry run history)"
-            onClick={async () => {
-              await fetch("/api/possible-automations", { method: "DELETE" });
-              showToast("Dry run history cleared. Ready for new run.", "success");
-            }}
-            style={{ borderColor: "rgba(239,68,68,0.3)", color: "#f87171" }}
-          >
-            🗑 Clear History
-          </button>
-          <button
-            className="seed-btn"
-            title="Clear all HouseholdLogs"
-            onClick={async () => {
-              await fetch("/api/logs", { method: "DELETE" });
-              showToast("Household logs cleared.", "success");
-            }}
-            style={{ borderColor: "rgba(239,68,68,0.3)", color: "#f87171" }}
-          >
-            🗑 Clear Logs
-          </button>
           <AlexaVoiceController
             houseState={houseState}
             onDeviceCommand={handleDeviceCommand}
             onAIResponse={handleVoiceAIResponse}
             activeAutomations={active}
             onAutomationUpdate={handleVoiceAutomationUpdate}
+            onLogDeviceEvent={handleLogVoiceDeviceEvent}
           />
         </div>
       </nav>

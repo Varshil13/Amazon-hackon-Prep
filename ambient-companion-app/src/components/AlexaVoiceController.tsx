@@ -29,6 +29,7 @@ export interface AlexaVoiceControllerProps {
   onAIResponse?: (message: string, detail: string) => void;
   activeAutomations?: ActiveAutomation[];
   onAutomationUpdate?: (updated: ActiveAutomation[]) => void;
+  onLogDeviceEvent?: (deviceId: DeviceId, action: "on" | "off") => void;
 }
 
 // ─── Component ────────────────────────────────────────────
@@ -38,6 +39,7 @@ export function AlexaVoiceController({
   onAIResponse,
   activeAutomations = [],
   onAutomationUpdate,
+  onLogDeviceEvent,
 }: AlexaVoiceControllerProps) {
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [isActive, setIsActive] = useState(false);
@@ -174,6 +176,10 @@ export function AlexaVoiceController({
                 delayMs = cmd.delay_minutes * 60000;
               }
               onDeviceCommand(cmd.deviceId as DeviceId, !!cmd.state, delayMs);
+              // Log immediate commands to PossibleAutomations for pattern learning
+              if (delayMs === 0) {
+                onLogDeviceEvent?.(cmd.deviceId as DeviceId, cmd.state ? "on" : "off");
+              }
             });
           } else if (action_type === "voice_command_execute") {
             // Fallback: LLM returned empty device_commands — parse command text directly
@@ -192,6 +198,7 @@ export function AlexaVoiceController({
               for (const [deviceId, keyword] of Object.entries(DEVICE_KEYWORDS)) {
                 if (lower.includes(keyword.trim())) {
                   onDeviceCommand(deviceId as DeviceId, isOn, 0);
+                  onLogDeviceEvent?.(deviceId as DeviceId, isOn ? "on" : "off");
                   break;
                 }
               }
@@ -202,7 +209,7 @@ export function AlexaVoiceController({
         speak("Sorry, I couldn't reach Alexa. Please try again.");
       }
     },
-    [speak, onAIResponse, onDeviceCommand, onAutomationUpdate]
+    [speak, onAIResponse, onDeviceCommand, onAutomationUpdate, onLogDeviceEvent]
   );
 
   // ── Entry Point 3a: One-shot command recording ─────────
