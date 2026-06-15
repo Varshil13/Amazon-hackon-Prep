@@ -225,7 +225,9 @@ If the voice command is about automations — such as changing schedules, cancel
 - Return "updated_automations" as the full new list (merge/modify/add/delete as needed based on what the user said)
 - Match the user's intent to existing automations by device name or action similarity — if same device/action exists, update it; otherwise add new
 - If user says to remove/cancel, exclude that automation from the list
-- Each automation in updated_automations must have: id (keep existing or generate new like "auto_<device>_<timestamp>"), name, trigger (time/condition), action (what to do), reasoning
+- Each automation in updated_automations must have: id (keep existing or generate new like "auto_<device>_<timestamp>"), name, trigger (time/condition), action (ONLY what the user explicitly asked — do NOT add off time if user only said turn on), reasoning
+- IMPORTANT: action field format must be EXACTLY "on at HH:MM" or "off at HH:MM" — do NOT add both on and off unless user explicitly mentioned both
+- IMPORTANT: "turn on daily at X" and "turn off daily at Y" are TWO SEPARATE automations with different ids — never merge them into one
 
 CRITICAL RULES — READ CAREFULLY:
 - "turn on X", "turn off X", "switch on X", "switch off X" WITHOUT any recurring word = action_type "voice_command_execute" with device_commands, NOT automation_update

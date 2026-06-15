@@ -172,28 +172,29 @@ function buildQueueFromAutomation(
   const isOff = lower.includes("turn off") || lower.includes("switch off") ||
                 lower.includes("disable") || lower.includes("deactivate") || lower.includes("stop");
 
-  // Try format 1: "on at 07:00" / "off at 07:00"
-  const strictMatches = [...auto.action.matchAll(/(on|off)\s+at\s+(\d{1,2}:\d{2})/gi)];
+  // Try format 1: explicit "on at 07:00" / "off at 07:00" or "turn on at 07:00" / "turn off at 07:00"
+  const strictMatches = [...auto.action.matchAll(/(turn\s+)?(on|off)\s+at\s+(\d{1,2}:\d{2})/gi)];
   if (strictMatches.length > 0) {
     strictMatches.forEach((m) => {
-      results.push({ time: m[2], device: deviceId, action: m[1].toLowerCase() === "on" });
+      const actionWord = m[2].toLowerCase(); // "on" or "off"
+      results.push({ time: m[3], device: deviceId, action: actionWord === "on" });
     });
     return results;
   }
 
-  // Try format 2: "at HH:MM" anywhere in action/name/trigger
+  // Try format 2: "at HH:MM" — only add if intent is clear (isOn XOR isOff)
   const fullText = `${auto.action} ${auto.name} ${auto.trigger}`;
   const timeMatches = [...fullText.matchAll(/at\s+(\d{1,2}:\d{2})/gi)];
-  if (timeMatches.length > 0 && (isOn || isOff)) {
+  if (timeMatches.length > 0 && (isOn || isOff) && !(isOn && isOff)) {
     timeMatches.forEach((m) => {
       results.push({ time: m[1], device: deviceId, action: isOn });
     });
     return results;
   }
 
-  // Try format 3: "at H AM/PM" → convert to HH:MM
+  // Try format 3: "at H AM/PM" — only add if intent is clear (isOn XOR isOff)
   const ampmMatches = [...fullText.matchAll(/at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/gi)];
-  if (ampmMatches.length > 0 && (isOn || isOff)) {
+  if (ampmMatches.length > 0 && (isOn || isOff) && !(isOn && isOff)) {
     ampmMatches.forEach((m) => {
       let h = parseInt(m[1]);
       const mins = m[2] ? parseInt(m[2]) : 0;
@@ -206,8 +207,8 @@ function buildQueueFromAutomation(
     return results;
   }
 
-  // Try format 4: top-level time field stored in DB
-  if (auto.time && (isOn || isOff)) {
+  // Try format 4: top-level time field stored in DB — only if intent is unambiguous
+  if (auto.time && (isOn || isOff) && !(isOn && isOff)) {
     results.push({ time: auto.time, device: deviceId, action: isOn });
     return results;
   }
@@ -331,10 +332,10 @@ export default function Home() {
       .then((r) => r.json())
       .then((d) => {
         if (d.success && d.automations?.length) {
-          setActive(d.automations);
-          // Rebuild dailyQueue from approved automations on mount
-          const queue = d.automations
-            .filter((a: ActiveAutomation) => a.userApproved)
+          // Only load user-approved automations into active state
+          const approved = d.automations.filter((a: ActiveAutomation) => a.userApproved);
+          setActive(approved);
+          const queue = approved
             .flatMap((auto: ActiveAutomation) => buildQueueFromAutomation(auto, DEVICE_CONFIG))
             .sort((a: { time: string }, b: { time: string }) => a.time.localeCompare(b.time));
           if (queue.length > 0) setDailyQueue(queue);
@@ -509,6 +510,35 @@ export default function Home() {
       const th12 = th === 0 ? 12 : th > 12 ? th - 12 : th;
       showToast(`Scheduled ${DEVICE_CONFIG[deviceId].label} to turn ${state ? "on" : "off"} at ${th12}:${String(tm).padStart(2, "0")} ${ampm}`, "success");
     } else {
+      const [h, m] = latestStateRef.current.time.split(":").map(Number);
+      const currentMinutes = h * 60 + m;
+      const toHHMM = (mins: number) => `${String(Math.floor(mins/60)).padStart(2,"0")}:${String(mins%60).padStart(2,"0")}`;
+
+      if (state) {
+        // Turning ON — track start time
+        setDeviceOnTimes((prev) => ({ ...prev, [deviceId]: currentMinutes }));
+      } else {
+        // Turning OFF — save session pair if we tracked an ON time
+        setDeviceOnTimes((prev) => {
+          if (prev[deviceId] !== undefined) {
+            const onMinutes = prev[deviceId]!;
+            fetch("/api/event/session", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                device: deviceId,
+                on_time: toHHMM(onMinutes),
+                off_time: toHHMM(currentMinutes),
+                duration_minutes: currentMinutes >= onMinutes ? currentMinutes - onMinutes : currentMinutes + 1440 - onMinutes,
+                day: currentDayRef.current,
+              }),
+            }).catch(() => {});
+          }
+          const next = { ...prev };
+          delete next[deviceId];
+          return next;
+        });
+      }
       setHouseState((prev) => ({
         ...prev,
         devices: { ...prev.devices, [deviceId]: state },
@@ -564,14 +594,26 @@ export default function Home() {
       return { ...a, userApproved: true, ...(extractedTime ? { time: extractedTime } : {}) };
     });
 
-    // Merge: keep existing approved automations, update/add voice ones by id
+    // Merge: keep existing automations, update/add voice ones
+    // Only update an existing automation if BOTH id AND action type (on/off) match exactly
+    // ON and OFF are separate automations — never overwrite one with the other
     const merged = [...activeRef.current];
     voiceApproved.forEach((va) => {
-      const idx = merged.findIndex((a) => a.id === va.id);
+      const vaIsOn = va.action.toLowerCase().includes("on at") || 
+                     va.action.toLowerCase().startsWith("on ") ||
+                     va.action.toLowerCase().includes("turn on");
+      const idx = merged.findIndex((a) => {
+        if (a.id !== va.id) return false;
+        // Same id — check if action type matches (both on or both off)
+        const aIsOn = a.action.toLowerCase().includes("on at") ||
+                      a.action.toLowerCase().startsWith("on ") ||
+                      a.action.toLowerCase().includes("turn on");
+        return aIsOn === vaIsOn;
+      });
       if (idx >= 0) {
-        merged[idx] = va; // update existing
+        merged[idx] = va; // update existing — same device, same action type
       } else {
-        merged.push(va); // add new
+        merged.push(va); // add as new separate automation
       }
     });
 
@@ -677,8 +719,10 @@ export default function Home() {
       const automRes = await fetch("/api/automations");
       const automData = await automRes.json();
       if (automData.success && automData.automations?.length > 0) {
-        setActive(automData.automations);
-        const queue = automData.automations
+        // Only load user-approved automations into active state
+        const approved = automData.automations.filter((a: ActiveAutomation) => a.userApproved);
+        setActive(approved);
+        const queue = approved
           .flatMap((auto: ActiveAutomation) => buildQueueFromAutomation(auto, DEVICE_CONFIG))
           .sort((a: { time: string }, b: { time: string }) => a.time.localeCompare(b.time));
         setDailyQueue(queue as { time: string; device: DeviceId; action: boolean }[]);
