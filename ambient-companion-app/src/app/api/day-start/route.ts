@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { dynamoDb } from "@/lib/dynamodb";
 import { PutCommand, ScanCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
+import { getPossibleAutomations } from "@/app/api/possible-automations/route";
 
 const ACTIVE_TABLE = "ActiveAutomations";
 
@@ -16,15 +17,10 @@ const isAwsConfigured = !!(
 export async function POST(request: Request) {
   const { day } = await request.json().catch(() => ({ day: 1 }));
 
-  // 1. Fetch last 3 days of possible automations
+  // 1. Fetch last 3 days of possible automations (direct call — same server, no HTTP hop)
   let events: { device: string; action: string; time: string; day: number }[] = [];
   try {
-    const baseUrl = process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : "http://localhost:3000";
-    const res = await fetch(`${baseUrl}/api/possible-automations?day=${day}`, { cache: "no-store" });
-    const data = await res.json();
-    if (data.success) events = data.events;
+    events = await getPossibleAutomations(day);
   } catch (e) { console.error("Failed to fetch possible automations:", e); }
 
   if (events.length === 0) {
@@ -134,25 +130,26 @@ ${directAutomations.map(a => `- device: "${a.device}", schedule: ${JSON.stringif
     return JSON.parse(content);
   };
 
-  // Tier 1: Local LM Studio
-  const localUrl   = process.env.LOCAL_LLM_URL   || "http://127.0.0.1:1234";
-  const localModel = process.env.LOCAL_LLM_MODEL || "meta-llama-3.1-8b-instruct";
-  try {
-    const result = await callLLM(localUrl, localModel);
-    if (Array.isArray(result)) {
-      automations = result;
-    }
-  } catch (e) {
-    console.warn("[day-start] Local LLM unavailable, trying Groq:", (e as Error).message);
-    // Tier 2: Groq fallback
-    if (process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "paste_your_groq_key_here") {
-      try {
-        const result = await callLLM("https://api.groq.com/openai", "llama-3.1-8b-instant", process.env.GROQ_API_KEY);
-        if (Array.isArray(result)) {
-          automations = result;
-        }
-      } catch (e2) { console.error("[day-start] Groq also failed:", (e2 as Error).message); }
-    }
+  // Tier 1: Groq cloud (primary)
+  if (process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "paste_your_groq_key_here") {
+    try {
+      const result = await callLLM("https://api.groq.com/openai", "llama-3.1-8b-instant", process.env.GROQ_API_KEY);
+      if (Array.isArray(result)) {
+        automations = result;
+      }
+    } catch (e) { console.warn("[day-start] Groq unavailable, trying local LLM:", (e as Error).message); }
+  }
+
+  // Tier 2: Local LM Studio (fallback)
+  if (automations.length === 0) {
+    const localUrl   = process.env.LOCAL_LLM_URL   || "http://127.0.0.1:1234";
+    const localModel = process.env.LOCAL_LLM_MODEL || "meta-llama-3.1-8b-instruct";
+    try {
+      const result = await callLLM(localUrl, localModel);
+      if (Array.isArray(result)) {
+        automations = result;
+      }
+    } catch (e) { console.error("[day-start] Local LLM also failed:", (e as Error).message); }
   }
 
   // Post-process: always use exact times and device IDs from directAutomations

@@ -385,23 +385,25 @@ Always respond with valid JSON only. No markdown.`
       return d;
     };
 
-    // ── Tier 1: Local LM Studio ────────────────────────────────────
-    const localUrl   = process.env.LOCAL_LLM_URL   || "http://127.0.0.1:1234";
-    const localModel = process.env.LOCAL_LLM_MODEL || "gemma-4-e2b-it-qat";
-    try {
-      const result = await callLLM(localUrl, localModel);
-      if (result) { aiDecision = normalize(result); console.log(`[AI] Local (${localModel}) OK`); }
-    } catch (e) {
-      console.warn("[AI] Local model unavailable, trying Groq:", (e as Error).message);
-    }
-
-    // ── Tier 2: Groq cloud fallback ───────────────────────────────────────────
-    if (!aiDecision && process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "paste_your_groq_key_here") {
+    // ── Tier 1: Groq cloud (primary) ──────────────────────────────
+    if (process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "paste_your_groq_key_here") {
       try {
         const result = await callLLM("https://api.groq.com/openai", "llama-3.1-8b-instant", process.env.GROQ_API_KEY);
-        if (result) { aiDecision = normalize(result); }
+        if (result) { aiDecision = normalize(result); console.log("[AI] Groq OK"); }
       } catch (e) {
-        console.warn("[AI] Groq also failed:", (e as Error).message);
+        console.warn("[AI] Groq unavailable, trying local model:", (e as Error).message);
+      }
+    }
+
+    // ── Tier 2: Local LM Studio (fallback) ────────────────────────
+    if (!aiDecision) {
+      const localUrl   = process.env.LOCAL_LLM_URL   || "http://127.0.0.1:1234";
+      const localModel = process.env.LOCAL_LLM_MODEL || "gemma-4-e2b-it-qat";
+      try {
+        const result = await callLLM(localUrl, localModel);
+        if (result) { aiDecision = normalize(result); console.log(`[AI] Local (${localModel}) OK`); }
+      } catch (e) {
+        console.warn("[AI] Local model also failed:", (e as Error).message);
       }
     }
 
