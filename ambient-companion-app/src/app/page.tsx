@@ -703,7 +703,44 @@ export default function Home() {
     }
   }, [speak]);
 
-  // ── Time slider — FROM main-2 ──────────────────────────
+  // ── Hardcoded power/heating appliance overuse checker ──
+  const DEVICE_THRESHOLDS: Partial<Record<DeviceId, { maxMinutes: number; label: string }>> = {
+    geyser:          { maxMinutes: 30,  label: "Geyser" },
+    induction:       { maxMinutes: 60,  label: "Induction" },
+    microwave:       { maxMinutes: 30,  label: "Microwave" },
+    ac:              { maxMinutes: 120, label: "AC" },
+    washing_machine: { maxMinutes: 90,  label: "Washing Machine" },
+    water_motor:     { maxMinutes: 30,  label: "Water Motor" },
+  };
+  const warnedDevicesRef = useRef<Set<DeviceId>>(new Set());
+
+  const checkDeviceOveruse = useCallback((currentMinutes: number) => {
+    Object.entries(DEVICE_THRESHOLDS).forEach(([deviceId, config]) => {
+      const id = deviceId as DeviceId;
+      const onSince = deviceOnTimes[id];
+      if (onSince === undefined) {
+        warnedDevicesRef.current.delete(id);
+        return;
+      }
+      if (warnedDevicesRef.current.has(id)) return;
+      const onForMinutes = currentMinutes >= onSince
+        ? currentMinutes - onSince
+        : currentMinutes + 1440 - onSince;
+      if (onForMinutes >= config.maxMinutes) {
+        warnedDevicesRef.current.add(id);
+        const hrs = Math.floor(onForMinutes / 60);
+        const mins = onForMinutes % 60;
+        const duration = hrs > 0
+          ? `${hrs} hour${hrs > 1 ? "s" : ""}${mins > 0 ? ` ${mins} minutes` : ""}`
+          : `${mins} minutes`;
+        const msg = `${config.label} has been on for ${duration}. You may want to switch it off.`;
+        speak(msg);
+        setReasoning({ message: `⚠️ ${msg}`, detail: "Power usage alert — hardcoded safety check." });
+      }
+    });
+  }, [deviceOnTimes, speak]);
+
+  // ── Time slider ────────────────────────────────────────
   // Full 24h range (0–1439), time-period greetings, pending command execution, checkAutomations
   const handleTimeChange = useCallback((minutes: number) => {
     const h    = Math.floor(minutes / 60);
@@ -763,7 +800,9 @@ export default function Home() {
 
     // Check active automations when slider moves
     checkAutomations(minutes);
-  }, [checkAutomations, speak, showToast]);
+    // Check for power/heating appliance overuse (hardcoded, no LLM)
+    checkDeviceOveruse(minutes);
+  }, [checkAutomations, checkDeviceOveruse, speak, showToast]);
 
   const formatTimeDisplay = (time: string) => {
     const [hStr, mStr] = time.split(":");
