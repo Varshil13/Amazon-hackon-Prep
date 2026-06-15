@@ -79,47 +79,34 @@ export async function POST(request: Request) {
     return NextResponse.json({ success: true, message: "Not enough consistent consecutive patterns yet.", automations: [] });
   }
 
-  // Format only qualified events for LLM
-  const eventSummary = Object.entries(qualifiedDevices).map(([device, patterns]) => {
-    const lines = patterns.map((p) =>
-      `  ${p.action.toUpperCase()} at ${p.time} — seen on consecutive ${p.days.map(d => `Day ${d}`).join(" and ")}`
-    ).join("\n");
-    return `${device}:\n${lines}`;
-  }).join("\n\n");
+  // Build automations directly from qualifiedDevices — don't let LLM decide times
+  // LLM only provides name and reasoning (cosmetic fields)
+  const directAutomations = Object.entries(qualifiedDevices).map(([device, patterns]) => {
+    const schedule = patterns.map((p) => ({ action: p.action, time: p.time }));
+    return {
+      id: `auto_${device}_${Date.now()}`,
+      name: device.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase()),
+      device,
+      schedule,
+      reasoning: `Consistent pattern detected on ${patterns[0].days.map(d => `Day ${d}`).join(" and ")}`,
+    };
+  });
 
-  // 3. Call LLM
-  const SYSTEM = `You are an automation learning agent for an Indian smart home.
-You are given manual device usage data from the last 3 days.
-Your job: identify consistent patterns and create automation schedules for today.
+  // Call LLM only for friendly name and reasoning — times and device are already correct
+  const SYSTEM = `You are a smart home assistant. Given device usage patterns, provide a friendly name and one-sentence reasoning for each automation. Do not change device IDs or schedule times.`;
 
-RULES:
-- Only suggest automating a device if the same action (on or off) happened at the same or very similar time (within 30 min) on at least 2 of the 3 days.
-- Never automate heating appliances: geyser, induction, microwave, boiler, iron.
-- Return a JSON array of automation objects — one per device that has a learnable pattern.
-- If no pattern exists for a device, do not include it.
-- Keep it minimal and practical.`;
+  const USER = `Provide friendly names and reasoning for these automations. Return ONLY a raw JSON array:
+${directAutomations.map(a => `- device: "${a.device}", schedule: ${JSON.stringify(a.schedule)}`).join("\n")}
 
-  const USER = `Today is Day ${day}. Here is the qualified pattern data (already filtered for consecutive days):
-
-${eventSummary}
-
-Create automation schedule entries for each device listed above.
-The device IDs in the data above are EXACT — use them as-is in the "device" field.
-Respond with ONLY a raw JSON array (no markdown):
 [
   {
     "id": "auto_<device_id>",
-    "name": "string — friendly name (e.g. 'Morning Bedroom Fan')",
-    "device": "<exact device_id from the data above — do not change>",
-    "schedule": [
-      { "action": "on" | "off", "time": "HH:MM" }
-    ],
-    "reasoning": "1 sentence why you chose this"
+    "name": "friendly name like 'Morning Bedroom Fan'",
+    "device": "<exact device_id — do not change>",
+    "schedule": <exact schedule from above — do not change>,
+    "reasoning": "1 sentence"
   }
-]
-
-IMPORTANT: The "device" field must be copied exactly from the device name shown in the data (e.g. bedroom_fan, water_motor, bedroom_light). Do not substitute or rename it.
-Return [] only if the input data is empty.`;
+]`;
 
   let automations: {
     id: string; name: string; device: string;
@@ -162,7 +149,7 @@ Return [] only if the input data is empty.`;
     // Tier 2: Groq fallback
     if (process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "paste_your_groq_key_here") {
       try {
-        const result = await callLLM("https://api.groq.com/openai", "llama-3.3-70b-versatile", process.env.GROQ_API_KEY);
+        const result = await callLLM("https://api.groq.com/openai", "llama-3.1-8b-instant", process.env.GROQ_API_KEY);
         if (Array.isArray(result)) {
           automations = result;
         }
@@ -170,20 +157,20 @@ Return [] only if the input data is empty.`;
     }
   }
 
-  // Post-process: override device field with exact ID from qualifiedDevices
-  // LLM may rename devices — this ensures correct device ID is always used
-  const qualifiedDeviceIds = Object.keys(qualifiedDevices);
-  automations = automations
-    .map((auto) => {
-      // Find best matching qualified device ID for this automation
-      const matchedId = qualifiedDeviceIds.find((qId) => {
-        const slug = qId.replace(/_/g, " ").toLowerCase();
-        const autoText = `${auto.device} ${auto.name}`.toLowerCase();
-        return autoText.includes(slug) || autoText.includes(qId.toLowerCase());
-      }) ?? auto.device;
-      return { ...auto, device: matchedId };
-    })
-    .filter((auto) => qualifiedDeviceIds.includes(auto.device)); // only keep devices that qualified
+  // Post-process: always use exact times and device IDs from directAutomations
+  // LLM only contributed name and reasoning — override everything else
+  automations = directAutomations.map((direct) => {
+    const llmMatch = automations.find((a) =>
+      a.device === direct.device ||
+      a.device?.toLowerCase().includes(direct.device.replace(/_/g, " ")) ||
+      direct.device.includes(a.device?.toLowerCase() ?? "")
+    );
+    return {
+      ...direct,
+      name: llmMatch?.name || direct.name,
+      reasoning: llmMatch?.reasoning || direct.reasoning,
+    };
+  });
 
   // 4. Write to ActiveAutomations (replace only llm-learned entries, preserve user-approved)
   if (isAwsConfigured && automations.length > 0) {

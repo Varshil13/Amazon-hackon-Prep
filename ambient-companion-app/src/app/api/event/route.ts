@@ -64,6 +64,7 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     const { houseState, sourceProfile = "parents", voiceCommand } = body;
+    const preTargetTime: string | null = body.preTargetTime ?? null;
 
     // Support legacy single-classification calls for backward compat
     const isLegacy = !houseState && body.classification;
@@ -245,7 +246,56 @@ CRITICAL RULES — READ CAREFULLY:
 `
       : "";
 
-    const USER_PROMPT = `${houseDesc}
+    // For voice commands, use a focused minimal prompt — avoids model getting distracted by context
+    const VOICE_USER_PROMPT = voiceCommand ? `The user said: "${voiceCommand}"
+Current time: ${effectiveHouseState.time}
+
+EXISTING ACTIVE AUTOMATIONS:
+${body.activeAutomations && body.activeAutomations.length > 0
+  ? body.activeAutomations.map((a: { id: string; name: string; action: string }) => `- id: "${a.id}" | name: "${a.name}" | action: "${a.action}"`).join("\n")
+  : "- none"}
+
+STEP 1 — Detect intent:
+- AUTOMATION (action_type="automation_update"): ONLY if command contains "everyday", "every day", "daily", "always", "from now on", "automatically", "each day", "every morning/evening/night", "schedule it daily", "recurring"
+- ONE-TIME SCHEDULED (action_type="voice_command_execute"): "turn on X at 7 PM", "turn on X after 10 minutes", "turn on X in 30 minutes", "turn on X at HH:MM" — calculate target_time as HH:MM based on current time
+- ONE-TIME IMMEDIATE (action_type="voice_command_execute"): "turn on X", "turn off X", "switch on X" — use target_time "now"
+
+TIME CALCULATION for scheduled commands:
+- Current time is ${effectiveHouseState.time}
+- "after X minutes" or "in X minutes" → add X minutes to current time, convert to HH:MM (24h format)
+- "at H AM/PM" → convert to HH:MM 24h format
+- Example: current time 07:00, "after 30 minutes" → target_time = "07:30"
+- Example: current time 07:00, "at 8 PM" → target_time = "20:00"
+
+STEP 2 — Respond with ONLY raw JSON (no markdown):
+
+For ONE-TIME commands:
+{
+  "action_type": "voice_command_execute",
+  "target_profile": "everyone",
+  "message": "1 sentence confirming what you did",
+  "reasoning": "direct command",
+  "suggested_automation": null,
+  "updated_automations": null,
+  "device_commands": [{ "deviceId": "exact_id", "state": true, "target_time": "now" }]
+}
+
+For AUTOMATION requests:
+{
+  "action_type": "automation_update",
+  "target_profile": "everyone",
+  "message": "1 sentence confirming automation created",
+  "reasoning": "user requested recurring automation",
+  "suggested_automation": null,
+  "updated_automations": [{ "id": "auto_<device>_<timestamp>", "name": "friendly name", "trigger": "time or condition", "action": "on at HH:MM", "reasoning": "user requested" }],
+  "device_commands": []
+}
+
+Available deviceIds: bedroom_light, night_light, geyser, ac, bedroom_fan, kitchen_light, induction, microwave, tv, living_fan, living_light, study_ceiling_light, study_lamp, study_fan, water_motor, washing_machine
+action field in updated_automations must be EXACTLY "on at HH:MM" or "off at HH:MM" only — nothing else.
+Keep existing automations in updated_automations list and add/modify as needed.` : null;
+
+    const USER_PROMPT = voiceCommand && VOICE_USER_PROMPT ? VOICE_USER_PROMPT : `${houseDesc}
 
 SHORT-TERM MEMORY (recent activity):
 ${memoryDesc}
@@ -290,12 +340,20 @@ device_commands: always an array. Empty [] for non-device actions. Each item: { 
     const callLLM = async (baseUrl: string, model: string, apiKey?: string) => {
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+      // For voice commands, use a focused system prompt — ambient prompt confuses smaller models
+      const systemContent = voiceCommand
+        ? `You are a smart home voice assistant. Execute device commands directly.
+Available deviceIds: bedroom_light, night_light, geyser, ac, bedroom_fan, kitchen_light, induction, microwave, tv, living_fan, living_light, study_ceiling_light, study_lamp, study_fan, water_motor, washing_machine.
+Always respond with valid JSON only. No markdown.`
+        : SYSTEM_PROMPT;
+
       const res = await fetch(`${baseUrl}/v1/chat/completions`, {
         method: "POST",
         headers,
         body: JSON.stringify({
           messages: [
-            { role: "system", content: SYSTEM_PROMPT },
+            { role: "system", content: systemContent },
             { role: "user",   content: USER_PROMPT   },
           ],
           model,
@@ -327,7 +385,7 @@ device_commands: always an array. Empty [] for non-device actions. Each item: { 
       return d;
     };
 
-    // ── Tier 1: Local Gemma 4 (LM Studio) ────────────────────────────────────
+    // ── Tier 1: Local LM Studio ────────────────────────────────────
     const localUrl   = process.env.LOCAL_LLM_URL   || "http://127.0.0.1:1234";
     const localModel = process.env.LOCAL_LLM_MODEL || "gemma-4-e2b-it-qat";
     try {
@@ -340,11 +398,26 @@ device_commands: always an array. Empty [] for non-device actions. Each item: { 
     // ── Tier 2: Groq cloud fallback ───────────────────────────────────────────
     if (!aiDecision && process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "paste_your_groq_key_here") {
       try {
-        const result = await callLLM("https://api.groq.com/openai", "llama-3.3-70b-versatile", process.env.GROQ_API_KEY);
-        if (result) { aiDecision = normalize(result); console.log("[AI] Groq fallback OK"); }
+        const result = await callLLM("https://api.groq.com/openai", "llama-3.1-8b-instant", process.env.GROQ_API_KEY);
+        if (result) { aiDecision = normalize(result); console.log("[AI] Groq response:", JSON.stringify(result)); }
       } catch (e) {
         console.warn("[AI] Groq also failed:", (e as Error).message);
       }
+    }
+
+    // ── Override target_time with pre-calculated value if frontend detected a delay ──
+    // Also fix state if LLM got it wrong — trust the command text over LLM
+    if (aiDecision && voiceCommand && Array.isArray(aiDecision.device_commands) && aiDecision.device_commands.length > 0) {
+      const lower = voiceCommand.toLowerCase();
+      const cmdIsOn  = lower.includes("turn on") || lower.includes("switch on") || lower.includes("enable") || lower.includes("start");
+      const cmdIsOff = lower.includes("turn off") || lower.includes("switch off") || lower.includes("disable") || lower.includes("stop");
+      aiDecision.device_commands = aiDecision.device_commands.map((cmd) => ({
+        ...cmd,
+        ...(preTargetTime ? { target_time: preTargetTime } : {}),
+        // Correct state only if command unambiguously says on or off
+        ...(cmdIsOn && !cmdIsOff ? { state: true } : {}),
+        ...(cmdIsOff && !cmdIsOn ? { state: false } : {}),
+      }));
     }
 
     // ── Tier 3: Hardcoded stub ────────────────────────────────────────────────

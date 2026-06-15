@@ -134,8 +134,31 @@ export function AlexaVoiceController({
   }, []);
 
   // ── Core: POST voice command → /api/event ──────────────
+  // Pre-parse delay from command text so LLM doesn't need to do math
+  const extractDelayMinutes = (cmd: string): number => {
+    const lower = cmd.toLowerCase();
+    // "after X hours" or "in X hours"
+    const hrMatch = lower.match(/(?:after|in)\s+(\d+(?:\.\d+)?)\s+hours?/);
+    if (hrMatch) return Math.round(parseFloat(hrMatch[1]) * 60);
+    // "after X minutes" or "in X minutes"
+    const minMatch = lower.match(/(?:after|in)\s+(\d+)\s+min(?:utes?)?/);
+    if (minMatch) return parseInt(minMatch[1]);
+    return 0;
+  };
+
   const sendVoiceCommand = useCallback(
     async (command: string) => {
+      // Pre-calculate target_time if command has "after/in X mins/hrs"
+      const preDelayMinutes = extractDelayMinutes(command);
+      let preTargetTime: string | null = null;
+      if (preDelayMinutes > 0) {
+        const [ch, cm] = (houseStateRef.current.time || "00:00").split(":").map(Number);
+        const targetMins = (ch * 60 + cm + preDelayMinutes) % 1440;
+        const th = Math.floor(targetMins / 60);
+        const tm = targetMins % 60;
+        preTargetTime = `${String(th).padStart(2,"0")}:${String(tm).padStart(2,"0")}`;
+      }
+
       try {
         const res = await fetch("/api/event", {
           method: "POST",
@@ -145,6 +168,7 @@ export function AlexaVoiceController({
             sourceProfile: "parents",
             voiceCommand: command,
             activeAutomations: activeAutomationsRef.current,
+            preTargetTime, // pass pre-calculated target time to backend
           }),
         });
         const data = await res.json();

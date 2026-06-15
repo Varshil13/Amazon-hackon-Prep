@@ -28,7 +28,7 @@ interface AudioEvent { roomId: RoomId; type: AlertType; label: string; }
 interface HouseState { devices: Record<DeviceId, boolean>; time: string; audioEvents: AudioEvent[]; }
 
 // Full 5-field shape — persisted to DynamoDB
-interface SuggestedAutomation { id: string; name: string; trigger: string; action: string; reasoning: string; }
+interface SuggestedAutomation { id: string; name: string; trigger: string; action: string; reasoning: string; device?: string; time?: string; }
 interface ActiveAutomation    { id: string; name: string; trigger: string; action: string; reasoning: string; userApproved?: boolean; time?: string; device?: string; }
 interface RoutinePattern { event: string; occurrences: number; typical_window: string; confidence: string; }
 
@@ -645,6 +645,8 @@ export default function Home() {
       action: automation.action,
       reasoning: automation.reasoning,
       userApproved: true,
+      ...(automation.device ? { device: automation.device } : {}),
+      ...(automation.time ? { time: automation.time } : {}),
     };
     setActive((prev) => {
       const updated = [...prev, newActive];
@@ -742,12 +744,14 @@ export default function Home() {
         const activeIds = new Set(activeRef.current.map((a) => a.id));
         const activeNames = new Set(activeRef.current.map((a) => a.name.toLowerCase()));
         const newSuggested = data.automations
-          .map((a: { id: string; name: string; trigger: string; action: string; reasoning: string; schedule?: { action: string; time: string }[] }) => ({
+          .map((a: { id: string; name: string; trigger: string; action: string; reasoning: string; device?: string; schedule?: { action: string; time: string }[] }) => ({
             id: a.id,
             name: a.name,
             trigger: a.trigger ?? `Day ${newDay}`,
             action: a.schedule ? a.schedule.map((s: { action: string; time: string }) => `${s.action} at ${s.time}`).join(", ") : a.action,
             reasoning: a.reasoning,
+            device: a.device,
+            time: a.schedule?.[0]?.time,
           }))
           .filter((a: { id: string; name: string }) =>
             !activeIds.has(a.id) && !activeNames.has(a.name.toLowerCase())
