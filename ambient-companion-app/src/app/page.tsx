@@ -139,12 +139,21 @@ function buildQueueFromAutomation(
 ): { time: string; device: string; action: boolean }[] {
   const results: { time: string; device: string; action: boolean }[] = [];
 
-  // Detect device from name or action
+  // Detect device from name or action — sort by length desc to match longer names first
   const findDevice = (text: string): string | null => {
     const lower = text.toLowerCase();
-    for (const [deviceId] of Object.entries(deviceConfig)) {
-      if (lower.includes(deviceId.replace(/_/g, " ")) || lower.includes(deviceId)) {
-        return deviceId;
+    const sortedDevices = Object.keys(deviceConfig).sort((a, b) => b.length - a.length);
+    for (const deviceId of sortedDevices) {
+      const slug = deviceId.replace(/_/g, " ");
+      const label = (deviceConfig[deviceId] as { label: string }).label.toLowerCase();
+      // For short tokens (<=3 chars like "ac", "tv"), require word boundary to avoid false substring matches
+      const needsBoundary = slug.length <= 3 || label.length <= 3;
+      if (needsBoundary) {
+        const re = new RegExp(`\\b${slug}\\b`);
+        const reLabel = new RegExp(`\\b${label}\\b`);
+        if (re.test(lower) || reLabel.test(lower)) return deviceId;
+      } else {
+        if (lower.includes(slug) || lower.includes(label)) return deviceId;
       }
     }
     return null;
@@ -223,6 +232,8 @@ export default function Home() {
   // Tracks the slider-minute at which each device was turned ON — used for anomaly detection
   const [deviceOnTimes, setDeviceOnTimes] = useState<Partial<Record<DeviceId, number>>>({});
   const [currentDay, setCurrentDay] = useState(1);
+  const currentDayRef = useRef(1);
+  useEffect(() => { currentDayRef.current = currentDay; }, [currentDay]);
   // Queue of automation actions for today, sorted by time
   const [dailyQueue, setDailyQueue] = useState<{ time: string; device: DeviceId; action: boolean }[]>([]);
   const dailyQueueRef = useRef(dailyQueue);
@@ -446,7 +457,7 @@ export default function Home() {
         device: deviceId,
         action: isCurrentlyOn ? "off" : "on",
         time: toHHMM(currentMinutes),
-        day: currentDay,
+        day: currentDayRef.current,
       }),
     }).catch(() => {});
 
@@ -463,7 +474,7 @@ export default function Home() {
               on_time: toHHMM(onMinutes),
               off_time: toHHMM(currentMinutes),
               duration_minutes: currentMinutes >= onMinutes ? currentMinutes - onMinutes : currentMinutes + 1440 - onMinutes,
-              day: currentDay,
+              day: currentDayRef.current,
             }),
           }).catch(() => {});
         }

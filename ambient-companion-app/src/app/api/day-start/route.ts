@@ -31,15 +31,59 @@ export async function POST(request: Request) {
     return NextResponse.json({ success: true, message: "No events yet — nothing to learn from.", automations: [] });
   }
 
-  // 2. Format events as readable table for LLM
+  // Pre-filter: only keep device+action combos that appear on at least 2 CONSECUTIVE days
+  //    at the same or similar time (within 30 min).
+  //    e.g. Day4+Day5 → suggest on Day6. Day4+Day6 (not consecutive) → do NOT suggest.
   const groupedByDevice: Record<string, { day: number; action: string; time: string }[]> = {};
   events.forEach((e) => {
     if (!groupedByDevice[e.device]) groupedByDevice[e.device] = [];
     groupedByDevice[e.device].push({ day: e.day, action: e.action, time: e.time });
   });
 
-  const eventSummary = Object.entries(groupedByDevice).map(([device, evts]) => {
-    const lines = evts.map((e) => `  Day ${e.day}: ${e.action.toUpperCase()} at ${e.time}`).join("\n");
+  const toMinutes = (t: string) => { const [h, m] = t.split(":").map(Number); return h * 60 + m; };
+
+  const qualifiedDevices: Record<string, { action: string; time: string; days: number[] }[]> = {};
+
+  for (const [device, evts] of Object.entries(groupedByDevice)) {
+    const qualified: { action: string; time: string; days: number[] }[] = [];
+
+    for (const actionType of ["on", "off"]) {
+      const filtered = evts
+        .filter((e) => e.action === actionType)
+        .sort((a, b) => a.day - b.day); // sort by day ascending
+
+      // Check for consecutive day pairs with similar time
+      for (let i = 0; i < filtered.length - 1; i++) {
+        const curr = filtered[i];
+        const next = filtered[i + 1];
+
+        // Must be consecutive days
+        if (next.day !== curr.day + 1) continue;
+
+        // Must be within ±30 min
+        const timeDiff = Math.abs(toMinutes(next.time) - toMinutes(curr.time));
+        if (timeDiff > 30) continue;
+
+        // Qualified — use average time
+        const avgMin = Math.round((toMinutes(curr.time) + toMinutes(next.time)) / 2);
+        const avgTime = `${String(Math.floor(avgMin / 60)).padStart(2, "0")}:${String(avgMin % 60).padStart(2, "0")}`;
+        qualified.push({ action: actionType, time: avgTime, days: [curr.day, next.day] });
+      }
+    }
+
+    if (qualified.length > 0) qualifiedDevices[device] = qualified;
+  }
+
+  // If no device has a qualifying consecutive pattern, return early
+  if (Object.keys(qualifiedDevices).length === 0) {
+    return NextResponse.json({ success: true, message: "Not enough consistent consecutive patterns yet.", automations: [] });
+  }
+
+  // Format only qualified events for LLM
+  const eventSummary = Object.entries(qualifiedDevices).map(([device, patterns]) => {
+    const lines = patterns.map((p) =>
+      `  ${p.action.toUpperCase()} at ${p.time} — seen on consecutive ${p.days.map(d => `Day ${d}`).join(" and ")}`
+    ).join("\n");
     return `${device}:\n${lines}`;
   }).join("\n\n");
 
@@ -55,17 +99,18 @@ RULES:
 - If no pattern exists for a device, do not include it.
 - Keep it minimal and practical.`;
 
-  const USER = `Today is Day ${day}. Here is the manual usage data from the last 3 days:
+  const USER = `Today is Day ${day}. Here is the qualified pattern data (already filtered for consecutive days):
 
 ${eventSummary}
 
-Based on this, create today's automation schedule.
+Create automation schedule entries for each device listed above.
+The device IDs in the data above are EXACT — use them as-is in the "device" field.
 Respond with ONLY a raw JSON array (no markdown):
 [
   {
-    "id": "auto_bedroom_light",
-    "name": "string — friendly name",
-    "device": "exact_device_id",
+    "id": "auto_<device_id>",
+    "name": "string — friendly name (e.g. 'Morning Bedroom Fan')",
+    "device": "<exact device_id from the data above — do not change>",
     "schedule": [
       { "action": "on" | "off", "time": "HH:MM" }
     ],
@@ -73,7 +118,8 @@ Respond with ONLY a raw JSON array (no markdown):
   }
 ]
 
-Return [] if no patterns are strong enough to automate.`;
+IMPORTANT: The "device" field must be copied exactly from the device name shown in the data (e.g. bedroom_fan, water_motor, bedroom_light). Do not substitute or rename it.
+Return [] only if the input data is empty.`;
 
   let automations: {
     id: string; name: string; device: string;
@@ -110,7 +156,6 @@ Return [] if no patterns are strong enough to automate.`;
     const result = await callLLM(localUrl, localModel);
     if (Array.isArray(result)) {
       automations = result;
-      console.log(`[day-start] Local LLM OK — ${automations.length} automations`);
     }
   } catch (e) {
     console.warn("[day-start] Local LLM unavailable, trying Groq:", (e as Error).message);
@@ -120,11 +165,25 @@ Return [] if no patterns are strong enough to automate.`;
         const result = await callLLM("https://api.groq.com/openai", "llama-3.3-70b-versatile", process.env.GROQ_API_KEY);
         if (Array.isArray(result)) {
           automations = result;
-          console.log(`[day-start] Groq fallback OK — ${automations.length} automations`);
         }
       } catch (e2) { console.error("[day-start] Groq also failed:", (e2 as Error).message); }
     }
   }
+
+  // Post-process: override device field with exact ID from qualifiedDevices
+  // LLM may rename devices — this ensures correct device ID is always used
+  const qualifiedDeviceIds = Object.keys(qualifiedDevices);
+  automations = automations
+    .map((auto) => {
+      // Find best matching qualified device ID for this automation
+      const matchedId = qualifiedDeviceIds.find((qId) => {
+        const slug = qId.replace(/_/g, " ").toLowerCase();
+        const autoText = `${auto.device} ${auto.name}`.toLowerCase();
+        return autoText.includes(slug) || autoText.includes(qId.toLowerCase());
+      }) ?? auto.device;
+      return { ...auto, device: matchedId };
+    })
+    .filter((auto) => qualifiedDeviceIds.includes(auto.device)); // only keep devices that qualified
 
   // 4. Write to ActiveAutomations (replace only llm-learned entries, preserve user-approved)
   if (isAwsConfigured && automations.length > 0) {
