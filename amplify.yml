@@ -1,0 +1,23 @@
+version: 1
+applications:
+  - appRoot: ambient-companion-app
+    frontend:
+      phases:
+        preBuild:
+          commands:
+            - npm ci --cache .npm --prefer-offline
+        build:
+          commands:
+            # Amplify only exposes env vars at build time, not to the Next.js
+            # server runtime. Write the runtime secrets into .env.production so
+            # Next.js bundles them into the server (API routes can read them).
+            - env | grep -e GROQ_API_KEY -e APP_AWS_ >> .env.production
+            - npm run build
+      artifacts:
+        baseDirectory: .next
+        files:
+          - '**/*'
+      cache:
+        paths:
+          - .next/cache/**/*
+          - .npm/**/*
