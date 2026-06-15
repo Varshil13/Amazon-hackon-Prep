@@ -595,25 +595,25 @@ export default function Home() {
     });
 
     // Merge: keep existing automations, update/add voice ones
-    // Only update an existing automation if BOTH id AND action type (on/off) match exactly
-    // ON and OFF are separate automations — never overwrite one with the other
+    // Dedupe by signature (device + on/off + time) — LLM sometimes returns duplicates
+    const sigOf = (a: ActiveAutomation): string => {
+      const isOn = a.action.toLowerCase().includes("on at") ||
+                   a.action.toLowerCase().startsWith("on ") ||
+                   a.action.toLowerCase().includes("turn on");
+      const timeMatch = a.action.match(/(\d{1,2}:\d{2})/) || (a.time ? [a.time, a.time] : null);
+      const time = timeMatch ? timeMatch[1] : "";
+      const dev = a.device || a.name.toLowerCase();
+      return `${dev}_${isOn ? "on" : "off"}_${time}`;
+    };
+
     const merged = [...activeRef.current];
     voiceApproved.forEach((va) => {
-      const vaIsOn = va.action.toLowerCase().includes("on at") || 
-                     va.action.toLowerCase().startsWith("on ") ||
-                     va.action.toLowerCase().includes("turn on");
-      const idx = merged.findIndex((a) => {
-        if (a.id !== va.id) return false;
-        // Same id — check if action type matches (both on or both off)
-        const aIsOn = a.action.toLowerCase().includes("on at") ||
-                      a.action.toLowerCase().startsWith("on ") ||
-                      a.action.toLowerCase().includes("turn on");
-        return aIsOn === vaIsOn;
-      });
+      const vaSig = sigOf(va);
+      const idx = merged.findIndex((a) => sigOf(a) === vaSig);
       if (idx >= 0) {
-        merged[idx] = va; // update existing — same device, same action type
+        merged[idx] = va; // same device + action + time → update, no duplicate
       } else {
-        merged.push(va); // add as new separate automation
+        merged.push(va); // genuinely new automation
       }
     });
 
@@ -1008,7 +1008,7 @@ export default function Home() {
 
       {/* ── NAVBAR ─────────────────────────────────────── */}
       <nav className="navbar">
-        <span className="nav-brand">⚡ Alexa Ambient</span>
+        <span className="nav-brand">⚡ Alexa companion</span>
 
         {/* Day arrows */}
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
@@ -1114,8 +1114,8 @@ export default function Home() {
             {suggested.length === 0 ? (
               <p className="empty-state">Trigger some events to see AI suggestions</p>
             ) : (
-              suggested.map((a) => (
-                <div key={a.id} className="auto-item">
+              suggested.map((a, i) => (
+                <div key={`${a.id}_${i}`} className="auto-item">
                   <div className="auto-item-name">{a.name}</div>
                   <div className="auto-item-desc">{a.trigger} → {a.action}</div>
                   <div className="auto-item-desc" style={{ fontStyle: "italic", color: "#6b7280" }}>
@@ -1140,8 +1140,8 @@ export default function Home() {
             {active.length === 0 ? (
               <p className="empty-state">No automations active yet</p>
             ) : (
-              active.map((a) => (
-                <div key={a.id} className="active-item">
+              active.map((a, i) => (
+                <div key={`${a.id}_${i}`} className="active-item">
                   <div className="active-item-left">
                     <span className="active-dot"></span>
                     <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>

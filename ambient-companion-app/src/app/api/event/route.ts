@@ -9,7 +9,7 @@ const DEVICE_MANIFEST = `AVAILABLE DEVICES IN THIS HOME:
 - Study Room: ceiling_light, desk_lamp, ceiling_fan
 - Utility/Balcony: water_motor, washing_machine`;
 
-const SYSTEM_PROMPT = `You are an autonomous ambient intelligence agent for an Indian household.
+const SYSTEM_PROMPT = `You are an autonomous companion intelligence agent for an Indian household.
 You observe the full state of the home — which devices are on, what time it is, recent audio events — and decide the single most helpful proactive action.
 
 Your job is NOT to respond to commands. Your job is to ANTICIPATE needs.
@@ -95,7 +95,7 @@ export async function POST(request: Request) {
     ];
     let sessionSummary: { device: string; sessions: number; mode_on: string | null; mode_off: string | null; typical_duration: number | null }[] = [];
 
-    // Only hit DynamoDB for ambient/proactive events — not for voice commands
+    // Only hit DynamoDB for companion/proactive events — not for voice commands
     if (isAwsConfigured && !voiceCommand) {
       const t0 = Date.now();
       try {
@@ -341,7 +341,7 @@ device_commands: always an array. Empty [] for non-device actions. Each item: { 
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
 
-      // For voice commands, use a focused system prompt — ambient prompt confuses smaller models
+      // For voice commands, use a focused system prompt — companion prompt confuses smaller models
       const systemContent = voiceCommand
         ? `You are a smart home voice assistant. Execute device commands directly.
 Available deviceIds: bedroom_light, night_light, geyser, ac, bedroom_fan, kitchen_light, induction, microwave, tv, living_fan, living_light, study_ceiling_light, study_lamp, study_fan, water_motor, washing_machine.
@@ -418,6 +418,44 @@ Always respond with valid JSON only. No markdown.`
         ...(cmdIsOn && !cmdIsOff ? { state: true } : {}),
         ...(cmdIsOff && !cmdIsOn ? { state: false } : {}),
       }));
+    }
+
+    // ── Fix automation_update action text to match the voice command intent ──
+    // LLM sometimes returns "on at HH:MM" when user said "off" (and vice versa)
+    // IMPORTANT: only correct NEW automations — never rewrite existing ones (they have their own intent)
+    if (aiDecision && voiceCommand && aiDecision.action_type === "automation_update" && Array.isArray((aiDecision as any).updated_automations)) {
+      const lower = voiceCommand.toLowerCase();
+      const cmdIsOn  = lower.includes("turn on") || lower.includes("switch on") || lower.includes("enable") || lower.includes("start");
+      const cmdIsOff = lower.includes("turn off") || lower.includes("switch off") || lower.includes("disable") || lower.includes("stop");
+      const intendedAction = cmdIsOff && !cmdIsOn ? "off" : cmdIsOn && !cmdIsOff ? "on" : null;
+
+      // Build a set of existing automation ids — don't touch these
+      const existingIds = new Set((body.activeAutomations || []).map((a: { id: string }) => a.id));
+
+      if (intendedAction) {
+        (aiDecision as any).updated_automations = (aiDecision as any).updated_automations.map((a: { id: string; name: string; trigger: string; action: string; reasoning: string }) => {
+          // Skip existing automations — only fix newly created ones
+          if (existingIds.has(a.id)) return a;
+
+          const timeMatch = a.action.match(/(\d{1,2}:\d{2})/);
+          const ampmMatch = a.action.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+          let timeStr: string | null = timeMatch ? timeMatch[1] : null;
+          if (!timeStr && ampmMatch) {
+            let h = parseInt(ampmMatch[1]);
+            const mins = ampmMatch[2] ? parseInt(ampmMatch[2]) : 0;
+            if (ampmMatch[3].toLowerCase() === "pm" && h !== 12) h += 12;
+            if (ampmMatch[3].toLowerCase() === "am" && h === 12) h = 0;
+            timeStr = `${String(h).padStart(2,"0")}:${String(mins).padStart(2,"0")}`;
+          }
+          const aIsOn = /\bon\s+at\b|turn\s+on/i.test(a.action);
+          const aIsOff = /\boff\s+at\b|turn\s+off/i.test(a.action);
+          if (timeStr && ((intendedAction === "off" && aIsOn && !aIsOff) || (intendedAction === "on" && aIsOff && !aIsOn))) {
+            const newName = a.name.replace(/\b(on|off)\b/gi, intendedAction === "on" ? "On" : "Off");
+            return { ...a, action: `${intendedAction} at ${timeStr}`, name: newName };
+          }
+          return a;
+        });
+      }
     }
 
     // ── Tier 3: Hardcoded stub ────────────────────────────────────────────────

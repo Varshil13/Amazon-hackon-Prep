@@ -1,7 +1,7 @@
 const fs = require('fs');
 const https = require('https');
 
-const SYSTEM_PROMPT = `You are an autonomous ambient intelligence agent for an Indian household.
+const SYSTEM_PROMPT = `You are an autonomous companion intelligence agent for an Indian household.
 You observe the full state of the home — which devices are on, what time it is, recent audio events — and decide the single most helpful proactive action.
 
 Your job is NOT to respond to commands. Your job is to ANTICIPATE needs.

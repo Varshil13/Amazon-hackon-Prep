@@ -64,10 +64,8 @@ export async function POST(request: Request) {
         const timeDiff = Math.abs(toMinutes(next.time) - toMinutes(curr.time));
         if (timeDiff > 30) continue;
 
-        // Qualified — use average time
-        const avgMin = Math.round((toMinutes(curr.time) + toMinutes(next.time)) / 2);
-        const avgTime = `${String(Math.floor(avgMin / 60)).padStart(2, "0")}:${String(avgMin % 60).padStart(2, "0")}`;
-        qualified.push({ action: actionType, time: avgTime, days: [curr.day, next.day] });
+        // Qualified — use the most recent day's actual time (no averaging)
+        qualified.push({ action: actionType, time: next.time, days: [curr.day, next.day] });
       }
     }
 
@@ -84,7 +82,7 @@ export async function POST(request: Request) {
   const directAutomations = Object.entries(qualifiedDevices).map(([device, patterns]) => {
     const schedule = patterns.map((p) => ({ action: p.action, time: p.time }));
     return {
-      id: `auto_${device}_${Date.now()}`,
+      id: `auto_${device}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       name: device.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase()),
       device,
       schedule,

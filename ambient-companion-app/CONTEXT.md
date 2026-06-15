@@ -1,4 +1,4 @@
-# Alexa Ambient Companion — Full Project Context
+# Alexa companion Companion — Full Project Context
 
 > **READ THIS FIRST.** You are an implementation agent on this project. You are NOT the architect. Every decision about what to build, what the AI should do, how the system should behave, and what the product vision is — has already been decided. Your job is to implement exactly what is described here, ask before making any structural changes, and never hallucinate features that are not in this document.
 
@@ -29,7 +29,7 @@
 
 ## 2. Our Vision
 
-This is a **simulator/prototype** of what an Amazon Echo device would do if it had ambient intelligence. The UI is purely for demonstration — in production, this runs headlessly on an Echo device.
+This is a **simulator/prototype** of what an Amazon Echo device would do if it had companion intelligence. The UI is purely for demonstration — in production, this runs headlessly on an Echo device.
 
 **Core philosophy:** The LLM is the brain. We give it sensory data (device states, audio events, time) and memory (recent history, learned patterns), and it decides what to do. We do NOT hardcode rules like "if baby cries 3 times, suggest lullaby." The AI reasons over context and decides.
 
@@ -218,7 +218,7 @@ The YAMNet component uses Tailwind classes (`text-sm`, `text-blue-500`, `animate
 ## 10. What The Demo Script Looks Like
 
 **Step 1 — Establish context:**
-"This is Alexa Ambient. It's a smart home AI that doesn't wait for commands — it learns from your home's rhythms."
+"This is Alexa companion. It's a smart home AI that doesn't wait for commands — it learns from your home's rhythms."
 
 **Step 2 — Show device control:**
 Toggle bedroom light → geyser ON. Time slider at 7AM. AI reasoning panel updates. If DynamoDB is seeded, AI should say something like "I've noticed you turn on the bedroom light and geyser every morning around 7AM."

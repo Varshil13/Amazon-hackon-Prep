@@ -1,6 +1,6 @@
-# Alexa Ambient Companion (Prototype)
+# Alexa companion Companion (Prototype)
 
-This is the prototype for the Amazon HackOn submission. The Ambient Companion listens for environmental audio cues (like a baby crying, water motor running, or pressure cooker whistle) and proactively suggests intelligent smart-home actions or commerce items.
+This is the prototype for the Amazon HackOn submission. The companion Companion listens for environmental audio cues (like a baby crying, water motor running, or pressure cooker whistle) and proactively suggests intelligent smart-home actions or commerce items.
 
 ## 🚀 Features
 - **Interactive Simulator**: A frontend dashboard built with Next.js to simulate audio events without hardware.
@@ -25,7 +25,7 @@ npm install
 
 ### 3. Setup Environment Variables
 To enable the live AI engine, you need a Groq API key.
-Create a new file named `.env.local` in the root of the `ambient-companion-app` folder (next to `package.json`).
+Create a new file named `.env.local` in the root of the `companion-companion-app` folder (next to `package.json`).
 
 Copy and paste the following into the file:
 ```env
