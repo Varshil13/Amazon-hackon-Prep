@@ -29,7 +29,7 @@ interface HouseState { devices: Record<DeviceId, boolean>; time: string; audioEv
 
 // Full 5-field shape — persisted to DynamoDB
 interface SuggestedAutomation { id: string; name: string; trigger: string; action: string; reasoning: string; }
-interface ActiveAutomation    { id: string; name: string; trigger: string; action: string; reasoning: string; }
+interface ActiveAutomation    { id: string; name: string; trigger: string; action: string; reasoning: string; userApproved?: boolean; time?: string; }
 interface RoutinePattern { event: string; occurrences: number; typical_window: string; confidence: string; }
 
 // ─── Static Config ────────────────────────────────────────
@@ -128,6 +128,81 @@ function parseActionToDevice(
   return null;
 }
 
+// ─── Queue builder helper ─────────────────────────────────
+// Builds dailyQueue entries from an automation — handles multiple time formats:
+// 1. action field: "on at 07:00" / "off at 07:00"
+// 2. action field: "turn on X at 7 AM"
+// 3. top-level time field (stored separately in DB)
+function buildQueueFromAutomation(
+  auto: { id: string; name: string; trigger: string; action: string; time?: string },
+  deviceConfig: Record<string, { label: string; room: string }>
+): { time: string; device: string; action: boolean }[] {
+  const results: { time: string; device: string; action: boolean }[] = [];
+
+  // Detect device from name or action
+  const findDevice = (text: string): string | null => {
+    const lower = text.toLowerCase();
+    for (const [deviceId] of Object.entries(deviceConfig)) {
+      if (lower.includes(deviceId.replace(/_/g, " ")) || lower.includes(deviceId)) {
+        return deviceId;
+      }
+    }
+    return null;
+  };
+
+  const deviceId = findDevice(auto.name) || findDevice(auto.action);
+  if (!deviceId) return results;
+
+  // Detect on/off state from action text
+  const lower = auto.action.toLowerCase();
+  const isOn  = lower.includes("turn on") || lower.includes("switch on") ||
+                lower.includes("enable")  || lower.includes("activate") || lower.includes("start");
+  const isOff = lower.includes("turn off") || lower.includes("switch off") ||
+                lower.includes("disable") || lower.includes("deactivate") || lower.includes("stop");
+
+  // Try format 1: "on at 07:00" / "off at 07:00"
+  const strictMatches = [...auto.action.matchAll(/(on|off)\s+at\s+(\d{1,2}:\d{2})/gi)];
+  if (strictMatches.length > 0) {
+    strictMatches.forEach((m) => {
+      results.push({ time: m[2], device: deviceId, action: m[1].toLowerCase() === "on" });
+    });
+    return results;
+  }
+
+  // Try format 2: "at HH:MM" anywhere in action/name/trigger
+  const fullText = `${auto.action} ${auto.name} ${auto.trigger}`;
+  const timeMatches = [...fullText.matchAll(/at\s+(\d{1,2}:\d{2})/gi)];
+  if (timeMatches.length > 0 && (isOn || isOff)) {
+    timeMatches.forEach((m) => {
+      results.push({ time: m[1], device: deviceId, action: isOn });
+    });
+    return results;
+  }
+
+  // Try format 3: "at H AM/PM" → convert to HH:MM
+  const ampmMatches = [...fullText.matchAll(/at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/gi)];
+  if (ampmMatches.length > 0 && (isOn || isOff)) {
+    ampmMatches.forEach((m) => {
+      let h = parseInt(m[1]);
+      const mins = m[2] ? parseInt(m[2]) : 0;
+      const period = m[3].toLowerCase();
+      if (period === "pm" && h !== 12) h += 12;
+      if (period === "am" && h === 12) h = 0;
+      const time = `${String(h).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
+      results.push({ time, device: deviceId, action: isOn });
+    });
+    return results;
+  }
+
+  // Try format 4: top-level time field stored in DB
+  if (auto.time && (isOn || isOff)) {
+    results.push({ time: auto.time, device: deviceId, action: isOn });
+    return results;
+  }
+
+  return results;
+}
+
 // ─── Main Page ────────────────────────────────────────────
 export default function Home() {
   const [houseState, setHouseState] = useState<HouseState>({
@@ -152,6 +227,8 @@ export default function Home() {
   const [dailyQueue, setDailyQueue] = useState<{ time: string; device: DeviceId; action: boolean }[]>([]);
   const dailyQueueRef = useRef(dailyQueue);
   useEffect(() => { dailyQueueRef.current = dailyQueue; }, [dailyQueue]);
+  // Track which queue items have already fired today (by "device_time" key) — reset on day change
+  const firedTodayRef = useRef<Set<string>>(new Set());
 
   const debounceRef          = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestStateRef       = useRef(houseState);
@@ -239,8 +316,18 @@ export default function Home() {
   useEffect(() => {
     fetch("/api/automations")
       .then((r) => r.json())
-      .then((d) => { if (d.success && d.automations?.length) setActive(d.automations); })
-      .catch(() => {}); // silent failure on load
+      .then((d) => {
+        if (d.success && d.automations?.length) {
+          setActive(d.automations);
+          // Rebuild dailyQueue from approved automations on mount
+          const queue = d.automations
+            .filter((a: ActiveAutomation) => a.userApproved)
+            .flatMap((auto: ActiveAutomation) => buildQueueFromAutomation(auto, DEVICE_CONFIG))
+            .sort((a: { time: string }, b: { time: string }) => a.time.localeCompare(b.time));
+          if (queue.length > 0) setDailyQueue(queue);
+        }
+      })
+      .catch(() => {});
   }, []);
 
   // ── Automation proactive checker ──────────────────────
@@ -376,6 +463,7 @@ export default function Home() {
               on_time: toHHMM(onMinutes),
               off_time: toHHMM(currentMinutes),
               duration_minutes: currentMinutes >= onMinutes ? currentMinutes - onMinutes : currentMinutes + 1440 - onMinutes,
+              day: currentDay,
             }),
           }).catch(() => {});
         }
@@ -420,6 +508,42 @@ export default function Home() {
     setReasoningAndSpeak({ message, detail });
   }, [setReasoningAndSpeak]);
 
+  // ── Handle automation update from voice command ────────
+  // Called when LLM returns action_type="automation_update" with updated_automations list
+  const handleVoiceAutomationUpdate = useCallback(async (updatedAutomations: ActiveAutomation[]) => {
+    // Voice-requested automations are always user-approved
+    const voiceApproved = updatedAutomations.map((a) => ({ ...a, userApproved: true }));
+
+    // Merge: keep existing approved automations, update/add voice ones by id
+    const merged = [...activeRef.current];
+    voiceApproved.forEach((va) => {
+      const idx = merged.findIndex((a) => a.id === va.id);
+      if (idx >= 0) {
+        merged[idx] = va; // update existing
+      } else {
+        merged.push(va); // add new
+      }
+    });
+
+    // 1. Update frontend state
+    setActive(merged);
+
+    // 2. Persist to DynamoDB via PATCH (full replace)
+    try {
+      await fetch("/api/automations", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ automations: merged }),
+      });
+    } catch { /* silent */ }
+
+    // 3. Rebuild dailyQueue from merged automations
+    const queue = merged
+      .flatMap(auto => buildQueueFromAutomation(auto, DEVICE_CONFIG))
+      .sort((a, b) => a.time.localeCompare(b.time));
+    setDailyQueue(queue as { time: string; device: DeviceId; action: boolean }[]);
+  }, []);
+
   // ── Optimistic "Automate This" with POST + rollback ────
   const handleAutomateThis = useCallback(async (automation: SuggestedAutomation) => {
     const newActive: ActiveAutomation = {
@@ -428,14 +552,26 @@ export default function Home() {
       trigger: automation.trigger,
       action: automation.action,
       reasoning: automation.reasoning,
+      userApproved: true,
     };
-    setActive((prev) => [...prev, newActive]);
+    setActive((prev) => {
+      const updated = [...prev, newActive];
+
+      // Immediately add to dailyQueue so it works same day
+      const queue = updated
+        .filter(a => a.userApproved)
+        .flatMap(auto => buildQueueFromAutomation(auto, DEVICE_CONFIG))
+        .sort((a, b) => a.time.localeCompare(b.time));
+      setDailyQueue(queue as { time: string; device: DeviceId; action: boolean }[]);
+
+      return updated;
+    });
     setSuggested((prev) => prev.filter((x) => x.id !== automation.id));
     try {
       const res = await fetch("/api/automations", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(newActive),
+        body: JSON.stringify({ ...newActive }),
       });
       const data = await res.json();
       if (data.success) {
@@ -500,10 +636,24 @@ export default function Home() {
   const handleDayChange = useCallback(async (newDay: number) => {
     if (newDay < 1) return;
     setCurrentDay(newDay);
-    // Reset time to midnight
+    firedTodayRef.current = new Set();
     setHouseState((prev) => ({ ...prev, time: "00:00", audioEvents: [] }));
     setReasoning({ message: `Day ${newDay} starting... Alexa is analyzing patterns.`, detail: "" });
 
+    // ── STEP 1: Fetch fresh active automations from DB and build queue ──
+    try {
+      const automRes = await fetch("/api/automations");
+      const automData = await automRes.json();
+      if (automData.success && automData.automations?.length > 0) {
+        setActive(automData.automations);
+        const queue = automData.automations
+          .flatMap((auto: ActiveAutomation) => buildQueueFromAutomation(auto, DEVICE_CONFIG))
+          .sort((a: { time: string }, b: { time: string }) => a.time.localeCompare(b.time));
+        setDailyQueue(queue as { time: string; device: DeviceId; action: boolean }[]);
+      }
+    } catch { /* silent — use existing activeRef if fetch fails */ }
+
+    // ── STEP 2: Call day-start for LLM suggestions ──
     try {
       const res = await fetch("/api/day-start", {
         method: "POST",
@@ -512,24 +662,28 @@ export default function Home() {
       });
       const data = await res.json();
       if (data.success && data.automations?.length > 0) {
-        // Build today's queue from the automations LLM returned
-        const queue: { time: string; device: DeviceId; action: boolean }[] = [];
-        data.automations.forEach((auto: { device: string; schedule: { action: string; time: string }[] }) => {
-          auto.schedule.forEach((s) => {
-            queue.push({ time: s.time, device: auto.device as DeviceId, action: s.action === "on" });
-          });
-        });
-        queue.sort((a, b) => a.time.localeCompare(b.time));
-        setDailyQueue(queue);
-        setActive(data.automations.map((a: { id: string; name: string; trigger: string; action: string; reasoning: string }) => a));
-        const msg = `Day ${newDay} routine ready. ${data.automations.length} automation${data.automations.length > 1 ? "s" : ""} scheduled based on your habits.`;
+        // LLM suggestions → suggested panel only, filter already-active
+        const activeIds = new Set(activeRef.current.map((a) => a.id));
+        const activeNames = new Set(activeRef.current.map((a) => a.name.toLowerCase()));
+        const newSuggested = data.automations
+          .map((a: { id: string; name: string; trigger: string; action: string; reasoning: string; schedule?: { action: string; time: string }[] }) => ({
+            id: a.id,
+            name: a.name,
+            trigger: a.trigger ?? `Day ${newDay}`,
+            action: a.schedule ? a.schedule.map((s: { action: string; time: string }) => `${s.action} at ${s.time}`).join(", ") : a.action,
+            reasoning: a.reasoning,
+          }))
+          .filter((a: { id: string; name: string }) =>
+            !activeIds.has(a.id) && !activeNames.has(a.name.toLowerCase())
+          );
+        setSuggested(newSuggested);
+        const msg = newSuggested.length > 0
+          ? `Day ${newDay} ready. ${newSuggested.length} new automation${newSuggested.length > 1 ? "s" : ""} suggested — check the suggestions panel.`
+          : `Day ${newDay} ready. Your ${activeRef.current.length} automation${activeRef.current.length > 1 ? "s are" : " is"} scheduled.`;
         speak(msg);
-        setReasoning({ message: msg, detail: data.automations.map((a: { name: string }) => a.name).join(", ") });
+        setReasoning({ message: msg, detail: newSuggested.map((a: { name: string }) => a.name).join(", ") });
       } else {
-        const msg = newDay < 3
-          ? `Day ${newDay}. Keep using devices manually — I'm learning your patterns.`
-          : `Day ${newDay}. Not enough consistent patterns yet to automate.`;
-        setDailyQueue([]);
+        const msg = `Day ${newDay} ready. ${activeRef.current.length > 0 ? `${activeRef.current.length} automation${activeRef.current.length > 1 ? "s" : ""} scheduled.` : "Keep using devices manually — I'm learning your patterns."}`;
         speak(msg);
         setReasoning({ message: msg, detail: "" });
       }
@@ -547,18 +701,18 @@ export default function Home() {
 
     // Fire daily queue items whose time the slider has crossed
     const queueTriggered: typeof dailyQueue = [];
-    const queueRemaining: typeof dailyQueue = [];
     dailyQueueRef.current.forEach((item) => {
       const [ih, im] = item.time.split(":").map(Number);
       const itemMinutes = ih * 60 + im;
-      if (minutes >= itemMinutes && minutes <= itemMinutes + 15) {
+      const fireKey = `${item.device}_${item.time}`;
+      // Trigger only if within window AND not already fired today
+      if (minutes >= itemMinutes && minutes <= itemMinutes + 15 && !firedTodayRef.current.has(fireKey)) {
         queueTriggered.push(item);
-      } else {
-        queueRemaining.push(item);
+        firedTodayRef.current.add(fireKey);
       }
     });
     if (queueTriggered.length > 0) {
-      setDailyQueue(queueRemaining);
+      // Do NOT remove from dailyQueue — items stay so they can fire next day too
       queueTriggered.forEach((item) => {
         const label = DEVICE_CONFIG[item.device]?.label ?? item.device;
         const msg = `Turning ${item.action ? "on" : "off"} ${label} as part of your daily routine.`;
@@ -802,6 +956,8 @@ export default function Home() {
             houseState={houseState}
             onDeviceCommand={handleDeviceCommand}
             onAIResponse={handleVoiceAIResponse}
+            activeAutomations={active}
+            onAutomationUpdate={handleVoiceAutomationUpdate}
           />
         </div>
       </nav>
@@ -899,11 +1055,27 @@ export default function Home() {
                     <span className="active-dot"></span>
                     <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
                       <span className="active-name">{a.name}</span>
-                      {getAutomationTimeLabel(a) && (
-                        <span style={{ fontSize: 10, color: "var(--amber)", fontWeight: 600 }}>
-                          ⏰ {getAutomationTimeLabel(a)}
-                        </span>
-                      )}
+                      {(() => {
+                        // Get actual scheduled times from queue builder
+                        const queueItems = buildQueueFromAutomation(a, DEVICE_CONFIG);
+                        if (queueItems.length > 0) {
+                          return (
+                            <span style={{ fontSize: 10, color: "var(--amber)", fontWeight: 600 }}>
+                              ⏰ {queueItems.map(q => {
+                                const [h, m] = q.time.split(":").map(Number);
+                                const ampm = h < 12 ? "AM" : "PM";
+                                const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+                                return `${q.action ? "ON" : "OFF"} at ${h12}:${String(m).padStart(2,"0")} ${ampm}`;
+                              }).join(" · ")}
+                            </span>
+                          );
+                        }
+                        // Fallback to keyword-based label
+                        const label = getAutomationTimeLabel(a);
+                        return label ? (
+                          <span style={{ fontSize: 10, color: "var(--amber)", fontWeight: 600 }}>⏰ {label}</span>
+                        ) : null;
+                      })()}
                     </div>
                   </div>
                   <button className="btn-remove" onClick={() => handleRemoveAutomation(a.id)}>

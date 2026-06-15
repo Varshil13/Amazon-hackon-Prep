@@ -212,18 +212,33 @@ VOICE COMMAND FROM USER: "${voiceCommand}"
 
 You are in VOICE COMMAND MODE. Respond to this command directly and helpfully.
 
-RULES:
-- Set action_type to "voice_command_execute" always.
-- ALWAYS include "device_commands" as a JSON array (even if empty).
-- Do NOT include a "device_command" field at all — only "device_commands".
-- For questions (time, weather, general info): answer in "message", set "device_commands": [].
-- For device commands: add one array item per action.
-  - Immediate action: { "deviceId": "...", "state": true, "target_time": "now" }
-  - Delayed action:   { "deviceId": "...", "state": false, "target_time": "07:00" }
-- For compound commands ("turn on X NOW and turn it off at 7 AM"), use TWO items:
-  [ {"deviceId":"microwave","state":true,"target_time":"now"}, {"deviceId":"microwave","state":false,"target_time":"07:00"} ]
-- target_time must be either "now" OR a 24h clock string like "07:00", "13:30", "22:00".
-- Current time is ${effectiveHouseState.time}.
+CURRENT ACTIVE AUTOMATIONS:
+${body.activeAutomations && body.activeAutomations.length > 0
+  ? body.activeAutomations.map((a: { id: string; name: string; trigger: string; action: string; reasoning: string }) =>
+      `- id: "${a.id}" | name: "${a.name}" | trigger: "${a.trigger}" | action: "${a.action}"`
+    ).join("\n")
+  : "- none"}
+
+AUTOMATION INTENT DETECTION:
+If the voice command is about automations — such as changing schedules, cancelling/removing an automation, adding a new routine, modifying times, or any phrase implying a recurring action (e.g. "every morning", "always", "daily", "from now on", "automatically", "routine", "stop automating", "don't automate", "every day", "each day") — then:
+- Set action_type to "automation_update"
+- Return "updated_automations" as the full new list (merge/modify/add/delete as needed based on what the user said)
+- Match the user's intent to existing automations by device name or action similarity — if same device/action exists, update it; otherwise add new
+- If user says to remove/cancel, exclude that automation from the list
+- Each automation in updated_automations must have: id (keep existing or generate new like "auto_<device>_<timestamp>"), name, trigger (time/condition), action (what to do), reasoning
+
+CRITICAL RULES — READ CAREFULLY:
+- "turn on X", "turn off X", "switch on X", "switch off X" WITHOUT any recurring word = action_type "voice_command_execute" with device_commands, NOT automation_update
+- "turn on X at HH:MM" (one-time, no recurring word) = action_type "voice_command_execute" with target_time in device_commands
+- ONLY use "automation_update" when user says "every day", "daily", "always", "from now on", "automatically", "routine", "schedule it", "every morning/evening/night"
+- ALWAYS include "device_commands" as a JSON array — empty [] only if truly no device action
+- Do NOT include a "device_command" field — only "device_commands" array
+- For questions: answer in "message", device_commands: []
+- Immediate device action: { "deviceId": "...", "state": true, "target_time": "now" }
+- Scheduled one-time: { "deviceId": "...", "state": false, "target_time": "07:00" }
+- Compound: [ {"deviceId":"X","state":true,"target_time":"now"}, {"deviceId":"X","state":false,"target_time":"07:00"} ]
+- target_time = "now" OR 24h string like "07:00", "13:30", "22:00"
+- Current time is ${effectiveHouseState.time}
 - Available deviceIds: bedroom_light, night_light, geyser, ac, bedroom_fan, kitchen_light, induction, microwave, tv, living_fan, living_light, study_ceiling_light, study_lamp, study_fan, water_motor, washing_machine
 `
       : "";
@@ -241,15 +256,17 @@ Profile context: ${sourceProfile}
 ${voiceSection}
 Decide the single most helpful proactive action. Respond with ONLY raw JSON (no markdown, no extra text):
 {
-  "action_type": "routine_suggestion" | "alert" | "family_connect" | "info" | "anomaly" | "voice_command_execute",
+  "action_type": "routine_suggestion" | "alert" | "family_connect" | "info" | "anomaly" | "voice_command_execute" | "automation_update",
   "target_profile": "parents" | "children" | "partner" | "everyone",
   "message": "1-2 sentence warm helpful message",
   "reasoning": "1 sentence: why you chose this action",
   "suggested_automation": { "name": "string", "trigger": "string", "action": "string" } | null,
+  "updated_automations": [ { "id": "string", "name": "string", "trigger": "string", "action": "string", "reasoning": "string" } ] | null,
   "device_commands": []
 }
 
-action_type guide: routine_suggestion=pattern worth automating, alert=safety/urgent, family_connect=family care needed, anomaly=unusual activity, info=routine log, voice_command_execute=direct spoken command.
+action_type guide: routine_suggestion=pattern worth automating, alert=safety/urgent, family_connect=family care needed, anomaly=unusual activity, info=routine log, voice_command_execute=direct spoken command, automation_update=user wants to change/add/remove recurring automations.
+updated_automations: only set when action_type is "automation_update" — full replacement list of active automations.
 device_commands: always an array. Empty [] for non-device actions. Each item: { "deviceId": string, "state": boolean, "target_time": "now" | "HH:MM" }`;
 
 

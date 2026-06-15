@@ -21,10 +21,14 @@ interface HouseState {
 
 type VoiceState = "idle" | "listening" | "woke" | "recording";
 
+interface ActiveAutomation { id: string; name: string; trigger: string; action: string; reasoning: string; }
+
 export interface AlexaVoiceControllerProps {
   houseState: HouseState;
   onDeviceCommand: (deviceId: DeviceId, state: boolean, delayMs: number) => void;
   onAIResponse?: (message: string, detail: string) => void;
+  activeAutomations?: ActiveAutomation[];
+  onAutomationUpdate?: (updated: ActiveAutomation[]) => void;
 }
 
 // ─── Component ────────────────────────────────────────────
@@ -32,6 +36,8 @@ export function AlexaVoiceController({
   houseState,
   onDeviceCommand,
   onAIResponse,
+  activeAutomations = [],
+  onAutomationUpdate,
 }: AlexaVoiceControllerProps) {
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [isActive, setIsActive] = useState(false);
@@ -44,6 +50,8 @@ export function AlexaVoiceController({
   const isCommandModeRef = useRef(false);
   const houseStateRef = useRef(houseState);
   houseStateRef.current = houseState; // Always fresh
+  const activeAutomationsRef = useRef(activeAutomations);
+  useEffect(() => { activeAutomationsRef.current = activeAutomations; }, [activeAutomations]);
 
   // startWakeWordRef breaks the circular dependency:
   // startWakeWordLoop → (on wake) → startCommandRecording → (on result) → startWakeWordLoop
@@ -124,9 +132,6 @@ export function AlexaVoiceController({
   }, []);
 
   // ── Core: POST voice command → /api/event ──────────────
-  // Architecture note: This component owns MICROPHONE + WAKE WORD only.
-  // TTS for AI responses is owned entirely by page.tsx via onAIResponse.
-  // This component only speaks for LOCAL mic-level errors (no network involved).
   const sendVoiceCommand = useCallback(
     async (command: string) => {
       try {
@@ -137,18 +142,23 @@ export function AlexaVoiceController({
             houseState: houseStateRef.current,
             sourceProfile: "parents",
             voiceCommand: command,
+            activeAutomations: activeAutomationsRef.current,
           }),
         });
         const data = await res.json();
         if (data.success) {
-          const { message, reasoning, action_type, device_commands } = data.data;
+          const { message, reasoning, action_type, device_commands, updated_automations } = data.data;
 
-          // 1. Propagate to parent — parent speaks via setReasoningAndSpeak().
-          //    Do NOT call speak() here; that would race with the parent's cancel().
+          // 1. Propagate message to parent for TTS
           onAIResponse?.(message, reasoning || "");
 
-          // 2. Execute device commands
-          if (action_type === "voice_command_execute" && Array.isArray(device_commands)) {
+          // 2. Handle automation update
+          if (action_type === "automation_update" && Array.isArray(updated_automations)) {
+            onAutomationUpdate?.(updated_automations);
+          }
+
+          // 3. Execute device commands — always, regardless of action_type
+          if (Array.isArray(device_commands) && device_commands.length > 0) {
             device_commands.forEach((cmd: { deviceId: string; state: boolean; target_time?: string; delay_minutes?: number }) => {
               if (!cmd.deviceId) return;
               let delayMs = 0;
@@ -165,14 +175,34 @@ export function AlexaVoiceController({
               }
               onDeviceCommand(cmd.deviceId as DeviceId, !!cmd.state, delayMs);
             });
+          } else if (action_type === "voice_command_execute") {
+            // Fallback: LLM returned empty device_commands — parse command text directly
+            const lower = command.toLowerCase();
+            const isOn  = lower.includes("turn on") || lower.includes("switch on") || lower.includes("enable") || lower.includes("start");
+            const isOff = lower.includes("turn off") || lower.includes("switch off") || lower.includes("disable") || lower.includes("stop");
+            if (isOn || isOff) {
+              const DEVICE_KEYWORDS: Record<string, string> = {
+                bedroom_light: "bedroom light", night_light: "night light", geyser: "geyser",
+                ac: " ac ", bedroom_fan: "bedroom fan", kitchen_light: "kitchen light",
+                induction: "induction", microwave: "microwave", tv: " tv ",
+                living_fan: "living fan", living_light: "living light",
+                study_ceiling_light: "study ceiling", study_lamp: "study lamp",
+                study_fan: "study fan", water_motor: "water motor", washing_machine: "washing machine",
+              };
+              for (const [deviceId, keyword] of Object.entries(DEVICE_KEYWORDS)) {
+                if (lower.includes(keyword.trim())) {
+                  onDeviceCommand(deviceId as DeviceId, isOn, 0);
+                  break;
+                }
+              }
+            }
           }
         }
       } catch {
-        // Local mic error — safe to speak here (no parent TTS in flight for errors)
         speak("Sorry, I couldn't reach Alexa. Please try again.");
       }
     },
-    [speak, onAIResponse, onDeviceCommand]
+    [speak, onAIResponse, onDeviceCommand, onAutomationUpdate]
   );
 
   // ── Entry Point 3a: One-shot command recording ─────────

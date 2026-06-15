@@ -41,7 +41,7 @@ export async function POST(request: Request) {
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const currentDay = parseInt(searchParams.get("day") || "1");
-  const fromDay = Math.max(1, currentDay - 3); // last 3 days inclusive
+  const fromDay = Math.max(1, currentDay - 2); // last 3 days: currentDay-2, currentDay-1, currentDay
 
   if (!isAwsConfigured) {
     // Mock: simulate 3 days of manual usage

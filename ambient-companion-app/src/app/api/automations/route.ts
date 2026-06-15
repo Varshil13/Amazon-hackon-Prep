@@ -21,6 +21,8 @@ export async function GET() {
       trigger: item.trigger,
       action: item.action,
       reasoning: item.reasoning,
+      userApproved: item.userApproved ?? false,
+      time: item.time ?? null,
     }));
     return NextResponse.json({ success: true, automations });
   } catch (error: unknown) {
@@ -43,7 +45,7 @@ export async function POST(request: NextRequest) {
   }
   try {
     await dynamoDb.send(
-      new PutCommand({ TableName: TABLE, Item: { id, name, trigger, action, reasoning } })
+      new PutCommand({ TableName: TABLE, Item: { id, name, trigger, action, reasoning, userApproved: body.userApproved ?? false, ...(body.time ? { time: body.time } : {}) } })
     );
     return NextResponse.json({ success: true });
   } catch (error: unknown) {
@@ -62,6 +64,37 @@ export async function DELETE(request: NextRequest) {
   }
   try {
     await dynamoDb.send(new DeleteCommand({ TableName: TABLE, Key: { id } }));
+    return NextResponse.json({ success: true });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return NextResponse.json({ success: false, error: message }, { status: 500 });
+  }
+}
+
+// PATCH — replace entire ActiveAutomations list (used after voice-driven automation edits)
+export async function PATCH(request: NextRequest) {
+  const body = await request.json().catch(() => ({}));
+  const { automations } = body;
+  if (!Array.isArray(automations)) {
+    return NextResponse.json({ success: false, error: "automations array required" }, { status: 400 });
+  }
+  if (!isAwsConfigured) {
+    return NextResponse.json({ success: true });
+  }
+  try {
+    // Delete all existing
+    const existing = await dynamoDb.send(new ScanCommand({ TableName: TABLE }));
+    await Promise.all(
+      (existing.Items || []).map((item) =>
+        dynamoDb.send(new DeleteCommand({ TableName: TABLE, Key: { id: item.id } }))
+      )
+    );
+    // Write the new list
+    await Promise.all(
+      automations.map((a: { id: string; name: string; trigger: string; action: string; reasoning: string; userApproved?: boolean; time?: string }) =>
+        dynamoDb.send(new PutCommand({ TableName: TABLE, Item: { id: a.id, name: a.name, trigger: a.trigger, action: a.action, reasoning: a.reasoning, userApproved: a.userApproved ?? false, ...(a.time ? { time: a.time } : {}) } }))
+      )
+    );
     return NextResponse.json({ success: true });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Unknown error";

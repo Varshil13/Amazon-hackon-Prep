@@ -81,42 +81,76 @@ Return [] if no patterns are strong enough to automate.`;
     reasoning: string;
   }[] = [];
 
-  if (process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "paste_your_groq_key_here") {
-    try {
-      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
-        body: JSON.stringify({
-          messages: [{ role: "system", content: SYSTEM }, { role: "user", content: USER }],
-          model: "llama-3.3-70b-versatile",
-          temperature: 0.1,
-        }),
-      });
-      if (res.ok) {
-        const groqData = await res.json();
-        let content = groqData?.choices?.[0]?.message?.content?.trim() || "[]";
-        content = content.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
-        automations = JSON.parse(content);
-      }
-    } catch (e) { console.error("LLM failed:", e); }
+  // Shared: call any OpenAI-compatible endpoint
+  const callLLM = async (baseUrl: string, model: string, apiKey?: string): Promise<typeof automations> => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        messages: [{ role: "system", content: SYSTEM }, { role: "user", content: USER }],
+        model,
+        temperature: 0.1,
+        max_tokens: 1024,
+        stream: false,
+      }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+    const data = await res.json();
+    let content = data?.choices?.[0]?.message?.content?.trim() || "[]";
+    content = content.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
+    return JSON.parse(content);
+  };
+
+  // Tier 1: Local LM Studio
+  const localUrl   = process.env.LOCAL_LLM_URL   || "http://127.0.0.1:1234";
+  const localModel = process.env.LOCAL_LLM_MODEL || "meta-llama-3.1-8b-instruct";
+  try {
+    const result = await callLLM(localUrl, localModel);
+    if (Array.isArray(result)) {
+      automations = result;
+      console.log(`[day-start] Local LLM OK — ${automations.length} automations`);
+    }
+  } catch (e) {
+    console.warn("[day-start] Local LLM unavailable, trying Groq:", (e as Error).message);
+    // Tier 2: Groq fallback
+    if (process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "paste_your_groq_key_here") {
+      try {
+        const result = await callLLM("https://api.groq.com/openai", "llama-3.3-70b-versatile", process.env.GROQ_API_KEY);
+        if (Array.isArray(result)) {
+          automations = result;
+          console.log(`[day-start] Groq fallback OK — ${automations.length} automations`);
+        }
+      } catch (e2) { console.error("[day-start] Groq also failed:", (e2 as Error).message); }
+    }
   }
 
-  // 4. Write to ActiveAutomations (replace today's entries)
+  // 4. Write to ActiveAutomations (replace only llm-learned entries, preserve user-approved)
   if (isAwsConfigured && automations.length > 0) {
     try {
-      // Clear existing automations first
+      // Delete only LLM-learned (non-user-approved) automations
       const existing = await dynamoDb.send(new ScanCommand({ TableName: ACTIVE_TABLE }));
       await Promise.all(
-        (existing.Items || []).map((item) =>
-          dynamoDb.send(new DeleteCommand({ TableName: ACTIVE_TABLE, Key: { id: item.id } }))
-        )
+        (existing.Items || [])
+          .filter((item) => !item.userApproved)
+          .map((item) =>
+            dynamoDb.send(new DeleteCommand({ TableName: ACTIVE_TABLE, Key: { id: item.id } }))
+          )
       );
-      // Write new ones
+      // Write new LLM-suggested ones (userApproved: false — pending user approval)
       await Promise.all(
         automations.map((auto) =>
           dynamoDb.send(new PutCommand({
             TableName: ACTIVE_TABLE,
-            Item: { ...auto, day, source: "llm_learned", trigger: `Day ${day}`, action: auto.schedule.map((s) => `${s.action} at ${s.time}`).join(", ") },
+            Item: {
+              ...auto,
+              day,
+              source: "llm_learned",
+              trigger: `Day ${day}`,
+              action: auto.schedule.map((s) => `${s.action} at ${s.time}`).join(", "),
+              userApproved: false,
+            },
           }))
         )
       );

@@ -4,7 +4,7 @@ import { PutCommand } from "@aws-sdk/lib-dynamodb";
 
 export async function POST(request: Request) {
   try {
-    const { device, on_time, off_time, duration_minutes } = await request.json();
+    const { device, on_time, off_time, duration_minutes, day } = await request.json();
     if (!device || !on_time || !off_time) {
       return NextResponse.json({ success: false, error: "Missing fields" }, { status: 400 });
     }
@@ -26,9 +26,10 @@ export async function POST(request: Request) {
         timestamp: Date.now(),
         type: "device_session",
         device,
-        on_time,   // "HH:MM" — discrete 15-min slot
-        off_time,  // "HH:MM" — discrete 15-min slot
+        on_time,
+        off_time,
         duration_minutes,
+        day: day ?? null,
         source: "parents",
       },
     }));
