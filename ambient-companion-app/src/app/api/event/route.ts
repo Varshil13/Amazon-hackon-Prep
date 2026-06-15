@@ -399,7 +399,7 @@ Always respond with valid JSON only. No markdown.`
     if (!aiDecision && process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "paste_your_groq_key_here") {
       try {
         const result = await callLLM("https://api.groq.com/openai", "llama-3.1-8b-instant", process.env.GROQ_API_KEY);
-        if (result) { aiDecision = normalize(result); console.log("[AI] Groq response:", JSON.stringify(result)); }
+        if (result) { aiDecision = normalize(result); }
       } catch (e) {
         console.warn("[AI] Groq also failed:", (e as Error).message);
       }

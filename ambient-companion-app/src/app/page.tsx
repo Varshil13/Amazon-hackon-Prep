@@ -234,6 +234,8 @@ export default function Home() {
   const [pendingCommands, setPendingCommands] = useState<{ deviceId: DeviceId; state: boolean; targetMinutes: number }[]>([]);
   // Tracks the slider-minute at which each device was turned ON — used for anomaly detection
   const [deviceOnTimes, setDeviceOnTimes] = useState<Partial<Record<DeviceId, number>>>({});
+  const deviceOnTimesRef = useRef(deviceOnTimes);
+  useEffect(() => { deviceOnTimesRef.current = deviceOnTimes; }, [deviceOnTimes]);
   const [currentDay, setCurrentDay] = useState(1);
   const currentDayRef = useRef(1);
   useEffect(() => { currentDayRef.current = currentDay; }, [currentDay]);
@@ -786,7 +788,7 @@ export default function Home() {
   const checkDeviceOveruse = useCallback((currentMinutes: number) => {
     Object.entries(DEVICE_THRESHOLDS).forEach(([deviceId, config]) => {
       const id = deviceId as DeviceId;
-      const onSince = deviceOnTimes[id];
+      const onSince = deviceOnTimesRef.current[id];
       if (onSince === undefined) {
         warnedDevicesRef.current.delete(id);
         return;
@@ -807,7 +809,7 @@ export default function Home() {
         setReasoning({ message: `⚠️ ${msg}`, detail: "Power usage alert — hardcoded safety check." });
       }
     });
-  }, [deviceOnTimes, speak]);
+  }, [speak]);
 
   // ── Time slider ────────────────────────────────────────
   // Full 24h range (0–1439), time-period greetings, pending command execution, checkAutomations
@@ -866,6 +868,22 @@ export default function Home() {
       queueTriggered.forEach((item) => { nextDevices[item.device] = item.action; });
       return { ...prev, devices: nextDevices, time };
     });
+
+    // Register ON/OFF times for fired commands so overuse detection works
+    if (triggered.length > 0 || queueTriggered.length > 0) {
+      setDeviceOnTimes((prev) => {
+        const next = { ...prev };
+        triggered.forEach((cmd) => {
+          if (cmd.state) next[cmd.deviceId] = minutes;
+          else delete next[cmd.deviceId];
+        });
+        queueTriggered.forEach((item) => {
+          if (item.action) next[item.device] = minutes;
+          else delete next[item.device];
+        });
+        return next;
+      });
+    }
 
     // Check active automations when slider moves
     checkAutomations(minutes);
